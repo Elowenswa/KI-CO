@@ -38,6 +38,7 @@ export interface LocalRetrievalDebugResult {
   elapsedMs: number;
   totalEntries: number;
   candidateCount: number;
+  effectiveLimit: number;
   tokens: string[];
   candidates: LocalRetrievalCandidate[];
   snippets: MemorySnippet[];
@@ -51,14 +52,46 @@ export interface ContextRetrievalTurn {
   query: string;
   mode?: "local" | "vector" | "hybrid";
   provider?: VectorProvider;
+  skipReason?: string;
   cacheHit: boolean;
   elapsedMs: number;
   totalEntries: number;
   candidateCount: number;
+  retrievalLimit?: number;
+  vectorTopK?: number;
+  memorySnippetLimit?: number;
+  vectorScoreThreshold?: number;
+  tokens?: string[];
+  candidates?: LocalRetrievalCandidate[];
+  explanation?: string[];
   snippets: MemorySnippet[];
   estimatedTokens: number;
   sourceMix?: Record<string, number>;
   error?: string;
+  topicRelation?: "same" | "related" | "changed";
+  ragAction?: "none" | "reuse" | "supplement" | "refresh";
+  noRagReason?: string;
+  reuseReason?: string;
+  supplementReason?: string;
+  refreshReason?: string;
+  topicMemorySetHash?: string;
+  turnsSinceRefresh?: number;
+  supplementCount?: number;
+  reusedMemoryCount?: number;
+  topicFingerprint?: string[];
+  topicGateDecision?: "reuse" | "supplement" | "refresh";
+  topicGateReason?: string;
+  topicGateConfidence?: "high" | "medium" | "low";
+  matchedRules?: string[];
+  winningRule?: string;
+  ragSkippedBecauseLowSemantic?: boolean;
+  ragSkippedBecauseIntimateContinuation?: boolean;
+  ragReusedBecauseTaskContinuation?: boolean;
+  supplementSkippedReason?: string;
+  supplementCooldownRemaining?: number;
+  supplementCandidateCount?: number;
+  supplementMergedNewCount?: number;
+  topicMemoryHashChangedBecause?: string;
 }
 
 export interface MemoryEntry {
@@ -101,6 +134,11 @@ export interface SourceDoc {
   entryType?: string;
   entryDate?: string;
 }
+
+export type ObsidianChunkInput = Partial<SourceDoc> & {
+  noteId?: string;
+  chunkId?: string;
+};
 
 export interface VectorIndexEntry {
   id: string;
@@ -207,6 +245,7 @@ const CONTEXT_RETRIEVAL_HISTORY_KEY = "kisera_cottage_context_retrieval_history_
 const CONTEXT_RETRIEVAL_UPDATE_EVENT = "kisera-cottage-context-retrieval-updated";
 const VECTOR_INDEX_KEY = "kisera_cottage_vector_index_v1";
 const OBSIDIAN_DOCS_KEY = "kisera_cottage_obsidian_docs_v1";
+const OBSIDIAN_INDEX_PREFIX = "obsidian_note:";
 const VECTOR_BUILD_STATUS_KEY = "kisera_cottage_vector_build_status_v1";
 const VECTOR_UPDATE_EVENT = "kisera-cottage-vector-updated";
 const CONTEXT_RETRIEVAL_HISTORY_LIMIT = 30;
@@ -222,6 +261,10 @@ const SOURCE_WEIGHT: Record<MemorySourceType, number> = {
   latest_style_example: 1.25,
   raw_memory: 1.1,
 };
+
+function isAutoIndexableCoreDoc(doc: SourceDoc): boolean {
+  return doc.sourceType === "memory-bank" || doc.sourceType === "chronicle";
+}
 
 export const DEFAULT_MEMORY_ENTRIES: MemoryEntry[] = [
   {
@@ -737,6 +780,7 @@ function listVectorIndex(): VectorIndexEntry[] {
 
 function saveVectorIndex(index: VectorIndexEntry[]): void {
   writeJson(VECTOR_INDEX_KEY, index);
+  retrievalCache.clear();
   dispatchVectorUpdate();
 }
 
@@ -919,12 +963,109 @@ function literalBonus(doc: SourceDoc, tokens: string[], retrieval: MemoryRetriev
   };
 }
 
+function exactQueryPhraseHits(query: string, doc: SourceDoc): string[] {
+  const haystack = normalizeRetrievalQuery([
+    doc.title,
+    doc.tags.join(" "),
+    doc.aliases.join(" "),
+    doc.content,
+  ].join("\n"));
+  const phrases = new Set<string>();
+  const cjkRuns = query.match(/[\u4e00-\u9fa5]{4,}/g) || [];
+  cjkRuns.forEach((run) => {
+    const maxLength = Math.min(12, run.length);
+    for (let length = maxLength; length >= 4; length -= 1) {
+      for (let start = 0; start <= run.length - length; start += 1) {
+        const phrase = run.slice(start, start + length);
+        if (haystack.includes(phrase)) phrases.add(phrase);
+      }
+      if (phrases.size >= 6) break;
+    }
+  });
+
+  const latinRuns = query.match(/[a-z0-9][a-z0-9\s._/-]{3,}[a-z0-9]/gi) || [];
+  latinRuns.forEach((run) => {
+    const phrase = normalizeRetrievalQuery(run).replace(/\s+/g, " ").trim();
+    if (phrase.length >= 4 && haystack.includes(phrase)) phrases.add(phrase);
+  });
+
+  return Array.from(phrases)
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 6);
+}
+
 function sourceMix(snippets: MemorySnippet[]): Record<string, number> {
   return snippets.reduce((acc: Record<string, number>, snippet) => {
     const key = snippet.source || "memory-bank";
     acc[key] = (acc[key] || 0) + 1;
     return acc;
   }, {});
+}
+
+function sourceBucketForContext(sourceType: MemorySourceType): "memory" | "chronicle" | "obsidian" | "style" | "raw" {
+  if (sourceType === "memory-bank") return "memory";
+  if (sourceType === "chronicle") return "chronicle";
+  if (sourceType === "latest_style_example") return "style";
+  if (sourceType === "obsidian_note") return "obsidian";
+  return "raw";
+}
+
+function isRelevantExternalContextRow(row: {
+  doc: SourceDoc;
+  vectorScore: number;
+  fusedScore: number;
+  matchedTokens: string[];
+  literalPriority: number;
+  strongLiteralPass: boolean;
+}): boolean {
+  if (row.doc.sourceType !== "obsidian_note" && row.doc.sourceType !== "latest_style_example") return true;
+  if (row.strongLiteralPass || row.literalPriority > 0 || row.matchedTokens.length > 0) return true;
+
+  // Obsidian is useful, but should not become a random old-note slot.
+  return row.fusedScore >= 0.42 || row.vectorScore >= 0.34;
+}
+
+function diversifyContextRows<Row extends { doc: SourceDoc }>(rows: Row[], limit: number): Row[] {
+  const k = Math.max(0, limit);
+  if (k <= 0) return [];
+  if (rows.length <= k) return rows.slice();
+
+  const caps: Record<ReturnType<typeof sourceBucketForContext>, number> = {
+    memory: Math.max(1, Math.ceil(k * 0.5)),
+    chronicle: Math.max(1, Math.floor(k * 0.3)),
+    obsidian: Math.max(1, Math.floor(k * 0.25)),
+    style: Math.max(1, Math.floor(k * 0.25)),
+    raw: Math.max(1, Math.floor(k * 0.25)),
+  };
+  const counts: Record<ReturnType<typeof sourceBucketForContext>, number> = {
+    memory: 0,
+    chronicle: 0,
+    obsidian: 0,
+    style: 0,
+    raw: 0,
+  };
+  const selected: Row[] = [];
+  const overflow: Row[] = [];
+
+  for (const row of rows) {
+    const bucket = sourceBucketForContext(row.doc.sourceType);
+    if (selected.length < k && counts[bucket] < caps[bucket]) {
+      selected.push(row);
+      counts[bucket] += 1;
+    } else {
+      overflow.push(row);
+    }
+    if (selected.length >= k) break;
+  }
+
+  if (selected.length < k) {
+    for (const row of overflow) {
+      selected.push(row);
+      if (selected.length >= k) break;
+    }
+  }
+
+  return selected;
 }
 
 function makeRetrievalCacheKey(entries: MemoryEntry[], query: string, limit: number, settings?: UplinkSettings | null): string {
@@ -983,6 +1124,62 @@ function estimateContextTokens(snippets: MemorySnippet[]): number {
   return snippets.reduce((sum, snippet) => sum + Math.max(1, Math.ceil(`${snippet.title}\n${snippet.text}`.length / 2.6)), 0);
 }
 
+function vectorRowMatchesDoc(
+  row: VectorIndexEntry | undefined,
+  doc: SourceDoc,
+  provider: VectorProvider,
+  model: string,
+): boolean {
+  return !!(
+    row
+    && row.provider === provider
+    && row.model === model
+    && row.sourceType === doc.sourceType
+    && row.sourceId === doc.sourceId
+    && row.parentId === doc.parentId
+    && row.fingerprint === docFingerprint(doc)
+    && Array.isArray(row.vector)
+    && row.vector.length > 0
+  );
+}
+
+function getAutoIndexableMissingDocs(settings: UplinkSettings | null | undefined, docs: SourceDoc[]): SourceDoc[] {
+  const runtime = getEmbeddingRuntimeStatus(settings);
+  const indexById = new Map(listVectorIndex().map((row) => [row.id, row]));
+  return docs.filter((doc) => (
+    isAutoIndexableCoreDoc(doc)
+    && !vectorRowMatchesDoc(indexById.get(doc.id), doc, runtime.actualProvider, runtime.model)
+  ));
+}
+
+export type ContextRetrievalMeta = Partial<Pick<
+  ContextRetrievalTurn,
+  | "topicRelation"
+  | "ragAction"
+  | "noRagReason"
+  | "reuseReason"
+  | "supplementReason"
+  | "refreshReason"
+  | "topicMemorySetHash"
+  | "turnsSinceRefresh"
+  | "supplementCount"
+  | "reusedMemoryCount"
+  | "topicFingerprint"
+  | "topicGateDecision"
+  | "topicGateReason"
+  | "topicGateConfidence"
+  | "matchedRules"
+  | "winningRule"
+  | "ragSkippedBecauseLowSemantic"
+  | "ragSkippedBecauseIntimateContinuation"
+  | "ragReusedBecauseTaskContinuation"
+  | "supplementSkippedReason"
+  | "supplementCooldownRemaining"
+  | "supplementCandidateCount"
+  | "supplementMergedNewCount"
+  | "topicMemoryHashChangedBecause"
+>>;
+
 function readContextRetrievalHistory(): ContextRetrievalTurn[] {
   try {
     const raw = localStorage.getItem(CONTEXT_RETRIEVAL_HISTORY_KEY);
@@ -994,8 +1191,14 @@ function readContextRetrievalHistory(): ContextRetrievalTurn[] {
   }
 }
 
-function recordContextRetrieval(result: LocalRetrievalDebugResult, settings?: UplinkSettings | null): void {
+function recordContextRetrieval(
+  result: LocalRetrievalDebugResult,
+  settings?: UplinkSettings | null,
+  meta?: ContextRetrievalMeta,
+  snippetsOverride?: MemorySnippet[],
+): void {
   const retrieval = resolveRetrievalSettings(settings);
+  const snippets = snippetsOverride || result.snippets;
   const turn: ContextRetrievalTurn = {
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: Date.now(),
@@ -1006,9 +1209,17 @@ function recordContextRetrieval(result: LocalRetrievalDebugResult, settings?: Up
     elapsedMs: result.elapsedMs,
     totalEntries: result.totalEntries,
     candidateCount: result.candidateCount,
-    snippets: result.snippets,
-    estimatedTokens: estimateContextTokens(result.snippets),
-    sourceMix: sourceMix(result.snippets),
+    retrievalLimit: result.effectiveLimit,
+    vectorTopK: retrieval.vectorTopK,
+    memorySnippetLimit: settings?.contextLoad?.memorySnippetLimit,
+    vectorScoreThreshold: retrieval.vectorScoreThreshold,
+    tokens: result.tokens,
+    candidates: result.candidates.slice(0, 8),
+    explanation: result.explanation,
+    snippets,
+    estimatedTokens: estimateContextTokens(snippets),
+    sourceMix: sourceMix(snippets),
+    ...meta,
   };
   try {
     localStorage.setItem(
@@ -1017,6 +1228,101 @@ function recordContextRetrieval(result: LocalRetrievalDebugResult, settings?: Up
     );
   } catch {
     // The active conversation still receives retrieved snippets if storage is unavailable.
+  }
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(CONTEXT_RETRIEVAL_UPDATE_EVENT));
+  }
+}
+
+export function recordContextRetrievalResult(
+  result: LocalRetrievalDebugResult,
+  settings?: UplinkSettings | null,
+  meta?: ContextRetrievalMeta,
+  snippetsOverride?: MemorySnippet[],
+): void {
+  recordContextRetrieval(result, settings, meta, snippetsOverride);
+}
+
+export function recordContextRetrievalAction(
+  query: string,
+  snippets: MemorySnippet[],
+  reason: string,
+  settings?: UplinkSettings | null,
+  meta?: ContextRetrievalMeta,
+): void {
+  const retrieval = resolveRetrievalSettings(settings);
+  const turn: ContextRetrievalTurn = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: Date.now(),
+    query,
+    mode: retrieval.memoryRetrievalMode,
+    provider: resolveActualProvider(settings),
+    cacheHit: snippets.length > 0,
+    elapsedMs: 0,
+    totalEntries: buildSourceDocs(settings).length,
+    candidateCount: snippets.length,
+    retrievalLimit: snippets.length,
+    vectorTopK: retrieval.vectorTopK,
+    memorySnippetLimit: settings?.contextLoad?.memorySnippetLimit,
+    vectorScoreThreshold: retrieval.vectorScoreThreshold,
+    tokens: tokenize(query),
+    candidates: [],
+    explanation: [reason],
+    snippets,
+    estimatedTokens: estimateContextTokens(snippets),
+    sourceMix: sourceMix(snippets),
+    ...meta,
+  };
+  try {
+    localStorage.setItem(
+      CONTEXT_RETRIEVAL_HISTORY_KEY,
+      JSON.stringify([turn, ...readContextRetrievalHistory()].slice(0, CONTEXT_RETRIEVAL_HISTORY_LIMIT)),
+    );
+  } catch {
+    // Diagnostics should not block the active conversation.
+  }
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(CONTEXT_RETRIEVAL_UPDATE_EVENT));
+  }
+}
+
+export function recordContextRetrievalSkip(
+  query: string,
+  reason: string,
+  settings?: UplinkSettings | null,
+  meta?: ContextRetrievalMeta,
+): void {
+  const retrieval = resolveRetrievalSettings(settings);
+  const turn: ContextRetrievalTurn = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: Date.now(),
+    query,
+    mode: retrieval.memoryRetrievalMode,
+    provider: resolveActualProvider(settings),
+    skipReason: reason,
+    cacheHit: false,
+    elapsedMs: 0,
+    totalEntries: buildSourceDocs(settings).length,
+    candidateCount: 0,
+    retrievalLimit: settings?.contextLoad?.memorySnippetLimit,
+    vectorTopK: retrieval.vectorTopK,
+    memorySnippetLimit: settings?.contextLoad?.memorySnippetLimit,
+    vectorScoreThreshold: retrieval.vectorScoreThreshold,
+    tokens: tokenize(query),
+    candidates: [],
+    explanation: [reason],
+    snippets: [],
+    estimatedTokens: 0,
+    sourceMix: {},
+    ...meta,
+  };
+  try {
+    localStorage.setItem(
+      CONTEXT_RETRIEVAL_HISTORY_KEY,
+      JSON.stringify([turn, ...readContextRetrievalHistory()].slice(0, CONTEXT_RETRIEVAL_HISTORY_LIMIT)),
+    );
+  } catch {
+    // Diagnostics should not block the active conversation.
   }
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent(CONTEXT_RETRIEVAL_UPDATE_EVENT));
@@ -1186,6 +1492,22 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
   const retrieval = resolveRetrievalSettings(settings);
   const effectiveLimit = Math.max(0, Math.min(24, Number(limit) || retrieval.vectorTopK || 4));
   const normalizedQuery = normalizeRetrievalQuery(query);
+  const mode = retrieval.memoryRetrievalMode;
+  let autoIndexReport: { indexed: number; reused: number; attempted: number; error?: string } = { indexed: 0, reused: 0, attempted: 0 };
+
+  if (mode !== "local" && docs.length > 0) {
+    const missingCoreDocs = getAutoIndexableMissingDocs(settings, docs);
+    if (missingCoreDocs.length > 0) {
+      autoIndexReport = { indexed: 0, reused: 0, attempted: missingCoreDocs.length };
+      try {
+        const report = await ensureDocsIndexed(settings, missingCoreDocs);
+        autoIndexReport = { ...report, attempted: missingCoreDocs.length };
+      } catch (error) {
+        autoIndexReport.error = error instanceof Error ? error.message : "按需补建索引失败";
+      }
+    }
+  }
+
   const cacheKey = makeRetrievalCacheKey(entries, query, effectiveLimit, settings);
   const cached = retrievalCache.get(cacheKey);
 
@@ -1211,9 +1533,8 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
   const queryVector = queryEmbedding.vector;
   const index = listVectorIndex();
   const indexById = new Map(index.map((row) => [row.id, row]));
-  const mode = retrieval.memoryRetrievalMode;
 
-  const ranked = docs
+  const scoredRows = docs
     .map((doc) => {
       const entryLike: MemoryEntry = {
         id: doc.id,
@@ -1238,6 +1559,10 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
           ? cosineSimilarity(queryVector, localEmbed(`${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}\n${doc.content}`))
           : 0;
       const literal = literalBonus(doc, tokens, retrieval);
+      const phraseHits = exactQueryPhraseHits(normalizedQuery, doc);
+      const phraseBoost = phraseHits.length
+        ? Math.min(0.8, 0.18 + phraseHits[0].length * 0.035)
+        : 0;
       const normalizedLocalScore = localScore / Math.max(1, tokens.length * 2);
       const localComponent = mode === "vector" ? 0 : normalizedLocalScore;
       const vectorComponent = mode === "local" ? 0 : Math.max(0, vectorScore);
@@ -1247,7 +1572,7 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
           ? vectorComponent * 0.72 + localComponent * 0.28
           : localComponent;
       const sourceWeight = SOURCE_WEIGHT[doc.sourceType] || 1;
-      const fusedBeforeRerank = (baseScore + literal.bonus) * sourceWeight;
+      const fusedBeforeRerank = (baseScore + literal.bonus + phraseBoost) * sourceWeight;
       const recencyBonus = Math.max(0, 0.08 - Math.max(0, Date.now() - doc.updatedAt) / (1000 * 60 * 60 * 24 * 365) * 0.02);
       const heuristicScore = retrieval.vectorRerank
         ? fusedBeforeRerank * 0.8 + vectorComponent * sourceWeight * 0.2 + recencyBonus + Math.max(0, doc.importance) * 0.02
@@ -1264,14 +1589,38 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
         sourceWeight,
         fusedScoreBeforeRerank: fusedBeforeRerank,
         fusedScore,
-        matchedTokens: literal.matchedTokens,
+        matchedTokens: [...phraseHits, ...literal.matchedTokens],
+        literalPriority: phraseHits.reduce((sum, phrase) => sum + phrase.length, 0) + (literal.exact !== "none" ? literal.matchedTokens.length : 0),
+        strongLiteralPass: phraseHits.length > 0 || (literal.exact !== "none" && literal.matchedTokens.length >= 3 && localScore >= 6),
       };
-    })
-    .filter(({ baseScore }) => {
+    });
+
+  let relaxedFallbackReason = "";
+  let ranked = scoredRows
+    .filter(({ baseScore, strongLiteralPass }) => {
       if (!tokens.length) return true;
-      return baseScore >= retrieval.vectorScoreThreshold;
+      return baseScore >= retrieval.vectorScoreThreshold || strongLiteralPass;
     })
-    .sort((a, b) => b.fusedScore - a.fusedScore || b.doc.updatedAt - a.doc.updatedAt);
+    .sort((a, b) => (
+      b.literalPriority - a.literalPriority
+      || b.fusedScore - a.fusedScore
+      || b.doc.updatedAt - a.doc.updatedAt
+    ));
+
+  if (!ranked.length && tokens.length) {
+    const localFallbackRows = scoredRows
+      .filter(({ localScore, matchedTokens, fusedScoreBeforeRerank }) => localScore > 0 || matchedTokens.length > 0 || fusedScoreBeforeRerank > 0)
+      .sort((a, b) => (
+        b.localScore - a.localScore
+        || b.fusedScoreBeforeRerank - a.fusedScoreBeforeRerank
+        || b.doc.importance - a.doc.importance
+        || b.doc.updatedAt - a.doc.updatedAt
+      ));
+    if (localFallbackRows.length) {
+      ranked = localFallbackRows;
+      relaxedFallbackReason = "向量阈值没有留下候选，本轮已回退到本地关键词候选，避免实时上下文空注入。";
+    }
+  }
 
   const localRank = new Map<string, number>();
   ranked
@@ -1284,10 +1633,13 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
     .sort((a, b) => b.vectorScore - a.vectorScore)
     .forEach((row, index) => vectorRank.set(row.doc.id, row.vectorScore > 0 ? index + 1 : -1));
 
+  const externallyRelevantRanked = ranked.filter(isRelevantExternalContextRow);
+  const relevantRanked = externallyRelevantRanked.length ? externallyRelevantRanked : ranked;
+  const diversifiedRows = diversifyContextRows(relevantRanked, effectiveLimit);
   const selectedRows: typeof ranked = [];
   const seenParents = new Set<string>();
   let usedChars = 0;
-  for (const row of ranked) {
+  for (const row of diversifiedRows) {
     if (selectedRows.length >= effectiveLimit) break;
     const parentKey = row.doc.parentId || row.doc.id;
     if (seenParents.has(parentKey)) continue;
@@ -1299,7 +1651,12 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
   }
   const selectedIds = new Set(selectedRows.map((row) => row.doc.id));
 
-  const candidates: LocalRetrievalCandidate[] = ranked.slice(0, Math.max(effectiveLimit, 12)).map(({ doc, fusedScore, fusedScoreBeforeRerank, localScore, vectorScore, matchedTokens }) => ({
+  const candidateRows = ranked.slice(0, Math.max(effectiveLimit, 12));
+  for (const row of selectedRows) {
+    if (!candidateRows.some((candidate) => candidate.doc.id === row.doc.id)) candidateRows.push(row);
+  }
+
+  const candidates: LocalRetrievalCandidate[] = candidateRows.map(({ doc, fusedScore, fusedScoreBeforeRerank, localScore, vectorScore, matchedTokens }) => ({
     id: doc.id,
     title: doc.title,
     tags: doc.tags,
@@ -1337,8 +1694,18 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
     embeddingFallbackReason
       ? `远程 embedding 暂不可用，本轮已回退本地 RAG：${embeddingFallbackReason}`
       : runtime.message,
-    `来源：记忆库 ${entries.length} 条；Obsidian ${listObsidianDocs().length} 条；当前可检索 ${docs.length} 条。`,
-    tokens.length ? `分词：${tokens.join(" / ")}` : "当前 query 没有可用关键词。",
+      autoIndexReport.indexed > 0
+        ? `已按需补建新记忆/新日记索引：${autoIndexReport.indexed} 条。`
+        : autoIndexReport.error
+          ? `新记忆/新日记按需补索引失败，已继续使用本地/已有索引召回：${autoIndexReport.error}`
+          : "",
+      `来源：记忆库 ${entries.length} 条；Obsidian ${listObsidianDocs().length} 条；当前可检索 ${docs.length} 条。`,
+      tokens.length ? `分词：${tokens.join(" / ")}` : "当前 query 没有可用关键词。",
+      ranked.some((row) => row.strongLiteralPass) ? "精确短语/强关键词命中已允许越过向量阈值，避免专名被泛向量候选压掉。" : "",
+      relaxedFallbackReason,
+      externallyRelevantRanked.length !== ranked.length ? `外脑弱相关过滤：${ranked.length - externallyRelevantRanked.length} 条。` : "",
+      !externallyRelevantRanked.length && ranked.length ? "外脑过滤无剩余候选，本轮已回退到原排序，避免空注入。" : "",
+      `来源混排：${Object.entries(sourceMix(snippets)).map(([source, count]) => `${source} ${count}`).join(" / ") || "none"}。`,
     `候选：${ranked.length} 条；注入：${snippets.length} 条；上限：${effectiveLimit} 条；预算：${snippetChars}/${retrieval.vectorContextBudgetChars} 字。`,
     snippets.length
       ? `最高分：${ranked[0]?.fusedScore.toFixed(3) ?? 0}，来自「${ranked[0]?.doc.title ?? ""}」。`
@@ -1351,6 +1718,7 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
     cacheKey,
     totalEntries: docs.length,
     candidateCount: ranked.length,
+    effectiveLimit,
     tokens,
     candidates,
     snippets,
@@ -1434,6 +1802,10 @@ export function getObsidianDocMeta(): { count: number; totalChars: number; style
 }
 
 export function clearObsidianDocs(): void {
+  const keptIndex = listVectorIndex().filter((row) => (
+    row.sourceType !== "obsidian_note" && !String(row.id || "").startsWith(OBSIDIAN_INDEX_PREFIX)
+  ));
+  saveVectorIndex(keptIndex);
   saveObsidianDocs([]);
 }
 
@@ -1449,6 +1821,105 @@ export function clearVectorIndex(): VectorBuildStatus {
     provider: "local",
     model: "local-hash-96",
   });
+}
+
+async function ensureDocsIndexed(settings: UplinkSettings | null | undefined, docs: SourceDoc[]): Promise<{ indexed: number; reused: number }> {
+  if (!docs.length) return { indexed: 0, reused: 0 };
+  const runtime = getEmbeddingRuntimeStatus(settings);
+  const provider = runtime.actualProvider;
+  const model = runtime.model;
+  const current = listVectorIndex();
+  const previousById = new Map(current.map((row) => [row.id, row]));
+  const next = [...current];
+  const nextById = new Map(next.map((row, index) => [row.id, index]));
+  let indexed = 0;
+  let reused = 0;
+
+  for (const doc of docs) {
+    const fingerprint = docFingerprint(doc);
+    const existing = previousById.get(doc.id);
+    if (
+      existing
+      && existing.provider === provider
+      && existing.model === model
+      && existing.sourceType === doc.sourceType
+      && existing.sourceId === doc.sourceId
+      && existing.parentId === doc.parentId
+      && existing.fingerprint === fingerprint
+      && Array.isArray(existing.vector)
+      && existing.vector.length > 0
+    ) {
+      reused += 1;
+      continue;
+    }
+
+    const text = `${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}\n${doc.content}`;
+    const embedded = await embedText(settings, text, "RETRIEVAL_DOCUMENT");
+    const row: VectorIndexEntry = {
+      id: doc.id,
+      updatedAt: Date.now(),
+      provider: embedded.provider,
+      model: embedded.model,
+      dim: embedded.vector.length,
+      vector: embedded.vector,
+      fingerprint,
+      sourceType: doc.sourceType,
+      sourceId: doc.sourceId,
+      parentId: doc.parentId,
+    };
+    const index = nextById.get(doc.id);
+    if (typeof index === "number") {
+      next[index] = row;
+    } else {
+      nextById.set(doc.id, next.length);
+      next.push(row);
+    }
+    indexed += 1;
+  }
+
+  if (indexed > 0) saveVectorIndex(next);
+  return { indexed, reused };
+}
+
+export async function syncObsidianChunks(settings: UplinkSettings | null | undefined, chunks: ObsidianChunkInput[]): Promise<{ docs: number; indexed: number; reused: number }> {
+  const normalized = (chunks || [])
+    .map((chunk, index) => {
+      const rawId = normalizeText(chunk.id || chunk.chunkId || `${chunk.noteId || "note"}:${index}`).trim();
+      const id = rawId.startsWith(OBSIDIAN_INDEX_PREFIX) ? rawId : `${OBSIDIAN_INDEX_PREFIX}${rawId}`;
+      const noteId = normalizeText(chunk.noteId || chunk.sourceId || rawId.split("#")[0] || `note:${index}`).trim();
+      const stage = normalizeText(chunk.stage || "");
+      const stageName = normalizeText(chunk.stageName || "");
+      const entryType = normalizeText(chunk.entryType || "");
+      const tags = Array.isArray(chunk.tags) ? [...chunk.tags] : [];
+      const aliases = Array.isArray(chunk.aliases) ? [...chunk.aliases] : [];
+      if (stage && !tags.includes(stage)) tags.push(stage);
+      if (entryType && !tags.includes(entryType)) tags.push(entryType);
+      if (stageName && !aliases.includes(stageName)) aliases.push(stageName);
+      return normalizeSourceDoc({
+        ...chunk,
+        id,
+        sourceType: "obsidian_note",
+        sourceId: noteId || rawId || `note:${index}`,
+        parentId: normalizeText(chunk.parentId || `obsidian:${noteId || rawId || index}`),
+        title: normalizeText(chunk.title || noteId || "Obsidian Note"),
+        importance: Number.isFinite(Number(chunk.importance)) ? Number(chunk.importance) : 1.25,
+        tags,
+        aliases,
+        stage,
+        stageName,
+        entryType,
+      }, index);
+    })
+    .filter(Boolean) as SourceDoc[];
+
+  if (!normalized.length) return { docs: 0, indexed: 0, reused: 0 };
+
+  const currentDocs = listObsidianDocs();
+  const docMap = new Map(currentDocs.map((doc) => [doc.id, doc]));
+  normalized.forEach((doc) => docMap.set(doc.id, doc));
+  saveObsidianDocs(Array.from(docMap.values()));
+  const report = await ensureDocsIndexed(settings, normalized);
+  return { docs: normalized.length, indexed: report.indexed, reused: report.reused };
 }
 
 export async function rebuildVectorIndex(settings?: UplinkSettings | null): Promise<VectorBuildStatus> {
@@ -1549,20 +2020,18 @@ export function getVectorIndexGuideStatus(settings?: UplinkSettings | null): Vec
   const runtime = getEmbeddingRuntimeStatus(settings);
   const index = listVectorIndex();
   const indexById = new Map(index.map((row) => [row.id, row]));
+  let nonAutoIndexableMissing = 0;
   const reusableCount = docs.reduce((count, doc) => {
     const row = indexById.get(doc.id);
-    return count + (row
-      && row.provider === runtime.actualProvider
-      && row.model === runtime.model
-      && row.fingerprint === docFingerprint(doc)
-      ? 1
-      : 0);
+    const reusable = vectorRowMatchesDoc(row, doc, runtime.actualProvider, runtime.model);
+    if (!reusable && !isAutoIndexableCoreDoc(doc)) nonAutoIndexableMissing += 1;
+    return count + (reusable ? 1 : 0);
   }, 0);
   return {
     totalDocs: docs.length,
     indexCount: index.length,
     reusableCount,
-    needsRebuild: docs.length > 0 && reusableCount < docs.length,
+    needsRebuild: docs.length > 0 && nonAutoIndexableMissing > 0,
     runtime,
   };
 }

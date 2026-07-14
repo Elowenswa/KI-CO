@@ -5,6 +5,15 @@ function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
+const OPENROUTER_APP_HEADERS = {
+  "HTTP-Referer": "https://ki-co.local",
+  "X-Title": "KI-CO Cottage",
+} as const;
+
+function openRouterAppHeadersForBase(baseUrl: string): Record<string, string> {
+  return /openrouter\.ai/i.test(String(baseUrl || "")) ? { ...OPENROUTER_APP_HEADERS } : {};
+}
+
 function normalizeTag(value: unknown): string {
   return String(value || "")
     .replace(/^#+/, "")
@@ -102,6 +111,7 @@ async function generateWithOpenAICompatible(provider: ModelProvider, profile: Pr
     headers: {
       Authorization: `Bearer ${profile.apiKey}`,
       "Content-Type": "application/json",
+      ...openRouterAppHeadersForBase(profile.baseUrl),
     },
     body: JSON.stringify(body),
   });

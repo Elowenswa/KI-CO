@@ -152,7 +152,18 @@ export function importSessionContinuity(value: unknown, sessionIdMap: Record<str
     const targetId = sessionIdMap[sessionId] || sessionId;
     const existing = current.cards[targetId];
     if (!existing || Number(card.updatedAt || 0) >= Number(existing.updatedAt || 0)) {
-      current.cards[targetId] = { ...card, sessionId: targetId };
+      const incomingCard = card as Partial<SessionStateCard> & { visibleToSolan?: boolean };
+      current.cards[targetId] = {
+        ...defaultCard(targetId),
+        ...incomingCard,
+        sessionId: targetId,
+        visibleToPersona: typeof incomingCard.visibleToPersona === "boolean"
+          ? incomingCard.visibleToPersona
+          : typeof incomingCard.visibleToSolan === "boolean"
+            ? incomingCard.visibleToSolan
+            : true,
+        updatedAt: Number(incomingCard.updatedAt || 0) || Date.now(),
+      };
     }
   });
   Object.values(handoffs).forEach((handoff) => {

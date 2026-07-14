@@ -13,6 +13,13 @@ export interface PromptCacheTurnStat {
   cacheStrategy?: string;
   cacheablePrefixTokens?: number;
   cacheablePrefixMinTokens?: number;
+  providerCacheMode?: string;
+  cacheControlUsed?: boolean;
+  cacheControlTtl?: string;
+  cacheControlSkipReason?: string;
+  cacheBreakpointBlock?: string;
+  requestChannel?: string;
+  cacheScope?: string;
 }
 
 export interface PromptCacheStatsSnapshot {
@@ -141,6 +148,13 @@ function readHistory(): PromptCacheTurnStat[] {
         cacheablePrefixMinTokens: Number.isFinite(Number(item?.cacheablePrefixMinTokens))
           ? Math.max(0, Math.round(Number(item.cacheablePrefixMinTokens)))
           : undefined,
+        providerCacheMode: typeof item?.providerCacheMode === "string" ? item.providerCacheMode : undefined,
+        cacheControlUsed: typeof item?.cacheControlUsed === "boolean" ? item.cacheControlUsed : undefined,
+        cacheControlTtl: typeof item?.cacheControlTtl === "string" ? item.cacheControlTtl : undefined,
+        cacheControlSkipReason: typeof item?.cacheControlSkipReason === "string" ? item.cacheControlSkipReason : undefined,
+        cacheBreakpointBlock: typeof item?.cacheBreakpointBlock === "string" ? item.cacheBreakpointBlock : undefined,
+        requestChannel: typeof item?.requestChannel === "string" ? item.requestChannel : undefined,
+        cacheScope: typeof item?.cacheScope === "string" ? item.cacheScope : undefined,
       }))
       .filter((item) => item.inputTokens > 0)
       .slice(-HISTORY_LIMIT);
@@ -177,7 +191,19 @@ export function recordPromptCacheTurn(
   provider: PromptCacheProvider,
   model: string,
   usage: any,
-  meta?: Pick<PromptCacheTurnStat, "cacheStrategy" | "cacheablePrefixTokens" | "cacheablePrefixMinTokens">,
+  meta?: Pick<
+    PromptCacheTurnStat,
+    | "cacheStrategy"
+    | "cacheablePrefixTokens"
+    | "cacheablePrefixMinTokens"
+    | "providerCacheMode"
+    | "cacheControlUsed"
+    | "cacheControlTtl"
+    | "cacheControlSkipReason"
+    | "cacheBreakpointBlock"
+    | "requestChannel"
+    | "cacheScope"
+  >,
 ): PromptCacheTurnStat | null {
   const parsed = parseUsageForPromptCache(usage);
   if (!parsed) return null;

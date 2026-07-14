@@ -12,6 +12,40 @@ import {
 } from "../storage/chronicles";
 
 const CURSOR_KEY = "kisera_cottage_chronicle_cursor_v1";
+const PENDING_RETRY_KEY = "kisera_cottage_chronicle_pending_retry_v1";
+
+type ChronicleWriteIntent = "auto" | "manual";
+
+const MANUAL_CHRONICLE_TRIGGER_PHRASES = [
+  "请写入记忆之页",
+  "写入记忆之页",
+  "写进记忆之页",
+  "写进小屋记忆之页",
+  "小屋记忆之页",
+  "写入时光回廊",
+  "写进时光回廊",
+  "保存到时光回廊",
+  "请写一篇日志",
+  "请写一篇日记",
+  "该写日记了",
+  "该写日志了",
+  "写日记",
+  "写日志",
+  "写日记吧",
+  "写日志吧",
+  "写进日记",
+  "写进日志",
+  "请总结并写入时光回廊",
+  "手动总结",
+];
+
+const MANUAL_CHRONICLE_TRIGGER_PATTERNS = [
+  /写(?:入|进|到).{0,10}(?:小屋)?记忆之页/u,
+  /写(?:入|进|到|成).{0,10}时光回廊/u,
+  /(?:该|可以|帮我|给我|请|来|现在)?.{0,8}写.{0,8}(?:日记|日志)(?:吧|一下|一篇)?/u,
+  /(?:日记|日志).{0,12}(?:写|存|记|记录|保存|写入|写进|整理|生成)/u,
+  /(?:记|存|保存).{0,8}(?:到|进).{0,6}(?:日记|日志|时光回廊)/u,
+];
 
 function emptyWatchContext() {
   return { title: "", currentTime: 0, duration: 0, sourceType: "local-file" as const, subtitleWindow: { previous: [], next: [] } };
@@ -27,6 +61,28 @@ function setCursor(sessionId: string, count: number) {
   localStorage.setItem(CURSOR_KEY, JSON.stringify(map));
 }
 
+function readPendingRetryMap(): Record<string, ChronicleWriteIntent> {
+  try { return JSON.parse(localStorage.getItem(PENDING_RETRY_KEY) || "{}"); } catch { return {}; }
+}
+
+function getPendingRetry(sessionId: string): ChronicleWriteIntent | null {
+  const value = readPendingRetryMap()[sessionId];
+  return value === "auto" || value === "manual" ? value : null;
+}
+
+function setPendingRetry(sessionId: string, intent: ChronicleWriteIntent) {
+  const map = readPendingRetryMap();
+  map[sessionId] = intent;
+  localStorage.setItem(PENDING_RETRY_KEY, JSON.stringify(map));
+}
+
+function clearPendingRetry(sessionId: string) {
+  const map = readPendingRetryMap();
+  if (!(sessionId in map)) return;
+  delete map[sessionId];
+  localStorage.setItem(PENDING_RETRY_KEY, JSON.stringify(map));
+}
+
 function activePersona(profile: PersonaProfile): PersonaCard {
   return profile.personas.find((persona) => persona.id === profile.activePersonaId) || profile.personas[0];
 }
@@ -36,10 +92,97 @@ function formatDate(timestamp: number): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
+function formatYmd(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function shortenText(text: string, max = 26): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+function cleanInlineTitle(text: string): string {
+  return String(text || "")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s*/gm, "")
+    .replace(/[#*_>`~\[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeTitleCandidate(text: string): string {
+  return cleanInlineTitle(text)
+    .replace(/^自动回退摘要[:：]?\s*/i, "")
+    .replace(/^(Sasha|Solan|Assistant|User|用户|我)[:：]\s*/i, "")
+    .replace(/^(title|标题|content|正文|summary|摘要)[:：]\s*/i, "")
+    .replace(/^日期[:：].*$/i, "")
+    .replace(/^记录者[:：].*$/i, "")
+    .replace(/^在场者[:：].*$/i, "")
+    .trim();
+}
+
+function isChronicleTemplateHeading(text: string): boolean {
+  const value = normalizeTitleCandidate(text);
+  const compact = value
+    .toLowerCase()
+    .replace(/[\s·:：|｜\-—–_=📓📜✨⭐*#"'“”‘’()[\]{}<>「」『』.,，。]+/g, "");
+  if (!compact) return true;
+  if (/^(chronicleentry|diaryentry|memorycorridor|chronicles|diary|日记|时光回廊)$/.test(compact)) return true;
+  if (compact.includes("chronicleentry") && compact.length <= 34) return true;
+  if (compact.includes("时光回廊") && compact.length <= 18) return true;
+  return false;
+}
+
+function isMeaningfulTitleCandidate(text?: string): boolean {
+  const value = normalizeTitleCandidate(String(text || ""));
+  if (!value) return false;
+  if (/^[-—–_=]{2,}$/.test(value)) return false;
+  if (isChronicleTemplateHeading(value)) return false;
+  if (/^(json|jason|markdown)$/i.test(value)) return false;
+  if (/^[{}[\],:："'\s]+$/.test(value)) return false;
+  if (/^tags?[:：]/i.test(value) || /^情感|氛围|关键词/.test(value)) return false;
+  const semantic = value.replace(/#[\w\u4e00-\u9fa5-]+/g, " ").replace(/[^\w\u4e00-\u9fa5]+/g, "").trim();
+  return semantic.length >= 2;
+}
+
+function deriveDiaryTitle(content: string): string {
+  const lines = String(content || "")
+    .split(/\n+/)
+    .map((line) => normalizeTitleCandidate(line))
+    .filter(isMeaningfulTitleCandidate);
+  const first = lines.find((line) => !/^tags?[:：]/i.test(line) && !/^情感|氛围|关键词/.test(line));
+  const sentence = first?.split(/[。！？!?；;]/)[0]?.trim();
+  return sentence && isMeaningfulTitleCandidate(sentence) ? shortenText(sentence, 24) : "";
+}
+
+function stripChronicleDecorations(value: string): string {
+  const lines = String(value || "").split(/\n/);
+  let start = 0;
+  while (start < lines.length) {
+    const line = lines[start].trim();
+    if (!line || isChronicleTemplateHeading(line)) {
+      start += 1;
+      continue;
+    }
+    break;
+  }
+  return lines.slice(start).join("\n").trim();
+}
+
 function stripJsonFence(value: string): any {
   const match = value.match(/```json\s*([\s\S]*?)\s*```/i) || value.match(/{[\s\S]*}/);
   if (!match) return null;
   try { return JSON.parse(match[1] || match[0]); } catch { return null; }
+}
+
+function normalizeChronicleSummaryOutput(value: string): string {
+  const parsed = stripJsonFence(value);
+  if (!parsed || typeof parsed !== "object" || typeof parsed.content !== "string") {
+    return stripChronicleDecorations(value);
+  }
+  const tags = Array.isArray(parsed.tags) ? parsed.tags.map(String).filter(Boolean).slice(0, 5) : [];
+  return [stripChronicleDecorations(parsed.content), tags.join(" ")].filter(Boolean).join("\n").trim();
 }
 
 async function callJournalModel(llm: LLMAdapter, profile: PersonaProfile, instruction: string, cacheScope: string) {
@@ -74,10 +217,24 @@ function conversationMaterial(conversation: ConversationRecord, profile: Persona
     .slice(0, 50000);
 }
 
+function isLowQualitySummary(value: string): boolean {
+  const raw = String(value || "").replace(/\s+/g, " ").trim();
+  if (!raw) return true;
+  if (raw.startsWith("自动回退摘要")) return true;
+  const lower = raw.toLowerCase();
+  if (["...", "…", "....", "。。。", "（空）", "(empty)", "empty", "n/a", "null", "undefined"].includes(lower)) return true;
+  const semantic = raw
+    .replace(/#[\w\u4e00-\u9fa5-]+/g, " ")
+    .replace(/[^\w\u4e00-\u9fa5]+/g, "")
+    .trim();
+  return semantic.length < 6;
+}
+
 export function isManualChronicleRequest(text: string): boolean {
   const value = text.trim();
-  if (!value || value.length > 80) return false;
-  return /(?:写|存|记录|保存).{0,10}(?:日记|日志|时光回廊|记忆之页)|(?:日记|日志|记忆之页).{0,10}(?:写|存|记录|保存)/u.test(value);
+  if (!value || value.length > 120) return false;
+  return MANUAL_CHRONICLE_TRIGGER_PHRASES.some((phrase) => value.includes(phrase))
+    || MANUAL_CHRONICLE_TRIGGER_PATTERNS.some((pattern) => pattern.test(value));
 }
 
 export async function writeConversationChronicle(
@@ -99,7 +256,9 @@ export async function writeConversationChronicle(
     && entry.mode === mode
   ));
   if (existing) return existing;
-  const result = await callJournalModel(llm, profile, `
+  let result = "";
+  try {
+    result = await callJournalModel(llm, profile, `
 请将以下对话（${personaName} 与 ${userName}）整理为一段“时光回廊”的日记（Chronicle Entry）。
 
 请让 ${personaName} 依据自己的人格核、当前对话与真实素材，用第一人称记录这段对话。
@@ -114,40 +273,53 @@ export async function writeConversationChronicle(
 5. 请同时提取 2-3 个【情感 / 氛围关键词】Tags，格式为 #关键词，放在文末。
    例如：#除夕夜 #吃醋 #代码调试 #哲思
 6. 可以结合人格核与对话气氛，自行判断是否少量使用 emoji / 颜文字。
+7. 不要输出标题、分割线、JSON、Markdown 代码块，或“Chronicle Entry / 时光回廊”这类包装文字；请直接输出日记正文，并在文末另起一行放 Tags。
 
 [防幻觉]
 如果对话主要是写作、翻译、代码、工具使用或普通协作，请诚实记录为对应的协作内容。
 不要强行升华情感，不要制造不存在的互动细节，也不要把一句玩笑写成长期承诺。
 
-[输出]
-写一个自然标题，不限制风格，不要把“自动总结、窗口名、日期、轮数”塞进标题。
-如有一句适合作为核心记忆的原句或凝练句，放入 anchor；没有则为空。
-只输出 JSON：{"title":"...","content":"...","tags":["#关键词"],"anchor":"..."}
-
 [人格核]
 ${personaCore || "（未提供人格核，按当前会话语气自然记录）"}
 
-窗口名称：${conversation.title}
-记录方式：${mode === "auto" ? "自动" : "手动"}
-
-[对话素材]
+对话内容：
 ${material}
 `, `chronicle:${conversation.id}`);
-  const parsed = stripJsonFence(result);
-  const content = String(parsed?.content || result).trim();
-  if (content.length < 8) return null;
+  } catch (error) {
+    console.warn("[Chronicle] journal model write failed; will retry on a later turn.", error);
+  }
+  const summary = normalizeChronicleSummaryOutput(result);
+  if (isLowQualitySummary(summary)) return null;
+  const tagRegex = /#[\w\u4e00-\u9fa5-]+/g;
+  const tags = Array.from(new Set((summary.match(tagRegex) || []).map((tag) => tag.replace(/^#/, "").trim()).filter(Boolean))).slice(0, 5);
+  const safeTags = tags.length > 0 ? tags : [mode === "auto" ? "自动总结" : "手动写入", "Chronicle"];
+  const content = summary.replace(tagRegex, "").trim() || summary.trim();
+  const normalized = content.replace(/\s+/g, " ").trim();
+  const latestAutoInSession = mode === "auto"
+    ? listChronicles().find((entry) => entry.sessionId === conversation.id && entry.title.startsWith("[自动总结]"))
+    : null;
+  const latestNormalized = String(latestAutoInSession?.content || "").replace(/\s+/g, " ").trim();
+  if (normalized && latestNormalized && normalized === latestNormalized) {
+    console.warn("[Chronicle] skipped duplicate auto summary.");
+    return latestAutoInSession ?? null;
+  }
+  const titleDate = formatYmd(new Date());
+  const title = mode === "auto"
+    ? `[自动总结][${conversation.title || "新对话"}] ${titleDate} · ${getChroniclePreferences().summaryFrequency}轮`
+    : `[手动写入][${conversation.title || "新对话"}] ${titleDate}`;
+  const diaryTitle = deriveDiaryTitle(content);
   const now = Date.now();
   return addChronicle({
-    title: String(parsed?.title || conversation.title || "今日小记").trim().slice(0, 80),
-    diaryTitle: String(parsed?.title || "").trim().slice(0, 80) || undefined,
+    title,
+    diaryTitle: diaryTitle || undefined,
     content,
     dateRange: formatDate(now),
     createdAt: now,
     isActive: true,
     starred: false,
     mode,
-    triggerKeywords: Array.isArray(parsed?.tags) ? parsed.tags.map(String).slice(0, 5) : [mode === "auto" ? "自动" : "手动"],
-    facts: parsed?.anchor ? [String(parsed.anchor).trim()] : [],
+    triggerKeywords: safeTags,
+    facts: [],
     sessionId: conversation.id,
     sessionTitle: conversation.title,
     personaId: persona?.id,
@@ -178,21 +350,27 @@ export async function maybeWriteChronicleAfterTurn(
   if (!intent) return null;
   const roundCount = conversation.messages.filter((message) => message.role === "user").length;
   const entry = await writeConversationChronicle(llm, profile, conversation, intent);
-  if (entry) setCursor(conversation.id, roundCount);
+  if (entry) {
+    setCursor(conversation.id, roundCount);
+    clearPendingRetry(conversation.id);
+  } else {
+    setPendingRetry(conversation.id, intent);
+  }
   return entry;
 }
 
 export function getChronicleWriteIntent(
   conversation: ConversationRecord,
   latestUserText: string,
-): "auto" | "manual" | null {
+): ChronicleWriteIntent | null {
   const preferences = getChroniclePreferences();
   const roundCount = conversation.messages.filter((message) => message.role === "user").length;
   const cursors = readCursorMap();
   const lastCursor = Math.max(0, Number(cursors[conversation.id]) || 0);
   const manual = isManualChronicleRequest(latestUserText);
+  const pending = getPendingRetry(conversation.id);
   const autoDue = preferences.autoEnabled && roundCount - lastCursor >= preferences.summaryFrequency;
-  return manual ? "manual" : autoDue ? "auto" : null;
+  return manual ? "manual" : pending || (autoDue ? "auto" : null);
 }
 
 export async function generateContinuityFromChronicles(

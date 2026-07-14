@@ -1,4 +1,4 @@
-﻿# 给其他 Coding AI 的实现提示 / Prompt For Another Coding AI
+# 给其他 Coding AI 的实现提示 / Prompt For Another Coding AI
 
 可以把下面这段发给 Claude Code、Codex 或其他 coding agent。
 

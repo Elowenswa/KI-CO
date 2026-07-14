@@ -1,7 +1,10 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ChangeEvent, type TouchEvent, type WheelEvent } from "react";
 import {
   Camera,
   Check,
+  ChevronDown,
+  ChevronRight,
+  Clapperboard,
   Copy,
   Database,
   Download,
@@ -12,7 +15,6 @@ import {
   Image as ImageIcon,
   Loader2,
   MessageCircle,
-  PanelLeftClose,
   Plus,
   RefreshCw,
   Search,
@@ -27,6 +29,7 @@ import type {
   ConversationAttachment,
   ConversationMessage,
   ConversationRecord,
+  MemorySnippet,
   UplinkSettings,
 } from "../../types";
 import type { AvatarPosition, PersonaProfile } from "../../storage/personaProfile";
@@ -34,28 +37,81 @@ import {
   createConversation,
   deleteConversation,
   getConversation,
-  importConversationRecords,
+  hydrateConversationRecords,
+  importConversationRecordsAsync,
   inspectConversationImport,
   listConversations,
+  normalizeConversationRecord,
   renameConversation,
   replaceConversationMessages,
 } from "../../storage/conversations";
 import { selectCacheFriendlyWindow } from "../../utils/contextWindow";
 import { shouldRetrieveMemory } from "../../utils/memoryRecallGate";
-import { buildTimeAwarenessContext } from "../../utils/timeAwareness";
+import { recordContextRetrievalAction, recordContextRetrievalResult, recordContextRetrievalSkip, retrieveMemorySnippetsDetailed, type ContextRetrievalMeta } from "../../storage/memoryBank";
+import {
+  commitTopicMemorySet,
+  evaluateTopicGate,
+  getTopicMemorySet,
+  topicMemorySetHash,
+  type TopicGateResult,
+  type TopicMemorySet,
+} from "../../utils/topicMemoryGate";
+import { buildTimeAwarenessContext, buildTimeBridgeMeta } from "../../utils/timeAwareness";
 import { MarkdownText } from "../MarkdownText";
 import { getChronicleWriteIntent, getContinuityContext, maybeWriteChronicleAfterTurn } from "../../services/chronicleService";
-import { getChroniclePreferences } from "../../storage/chronicles";
+import { getChroniclePreferences, getContinuityLine } from "../../storage/chronicles";
 import {
   captureWindowHandoff,
   clearSessionStateCard,
+  exportSessionContinuity,
   getSessionStateCard,
   getWindowHandoff,
+  importSessionContinuity,
   markWindowHandoffUsed,
   patchSessionStateCard,
   queueSessionStateCardUpdate,
   subscribeSessionContinuity,
 } from "../../services/sessionStateService";
+
+function filterPersonaMemories(
+  memories: MemorySnippet[],
+  allowMemory: boolean,
+  allowChronicles: boolean,
+): MemorySnippet[] {
+  return memories.filter((memory) => {
+    const source = memory.source || "memory-bank";
+    const isChronicle = source === "chronicle" || memory.id.startsWith("chronicle:");
+    if (isChronicle) return allowChronicles;
+    return allowMemory;
+  });
+}
+
+function topicDebugMeta(gate: TopicGateResult, set?: TopicMemorySet, extras: ContextRetrievalMeta = {}): ContextRetrievalMeta {
+  return {
+    topicGateDecision: gate.decision,
+    topicGateReason: gate.reason,
+    topicGateConfidence: gate.confidence,
+    matchedRules: gate.matchedRules,
+    winningRule: gate.winningRule,
+    topicRelation: gate.relation,
+    ragAction: gate.ragAction,
+    noRagReason: gate.noRagReason || "",
+    reuseReason: gate.reuseReason || "",
+    supplementReason: gate.supplementReason || "",
+    refreshReason: gate.refreshReason || "",
+    topicMemorySetHash: topicMemorySetHash(set),
+    turnsSinceRefresh: set?.turnCount || 0,
+    supplementCount: set?.supplementCount || 0,
+    reusedMemoryCount: set?.memoryIds.length || 0,
+    topicFingerprint: (set?.topicFingerprint || gate.topicFingerprint).slice(0, 16),
+    ragSkippedBecauseLowSemantic: !!gate.ragSkippedBecauseLowSemantic,
+    ragSkippedBecauseIntimateContinuation: !!gate.ragSkippedBecauseIntimateContinuation,
+    ragReusedBecauseTaskContinuation: !!gate.ragReusedBecauseTaskContinuation,
+    supplementSkippedReason: gate.supplementSkippedReason || "",
+    supplementCooldownRemaining: gate.supplementCooldownRemaining || 0,
+    ...extras,
+  };
+}
 
 interface ChatPageProps {
   adapters: CompanionAdapters;
@@ -376,10 +432,13 @@ function MessageAvatar({
   const position = isUser ? personaProfile?.userAvatarPosition : activePersona?.avatarPosition;
   const name = isUser ? personaProfile?.userName : activePersona?.name;
   const fallback = isUser ? "U" : "C";
+  const showAvatars = personaProfile?.showAvatars ?? true;
+
+  if (!showAvatars) return null;
 
   return (
     <div className="cottage-message-avatar">
-      {personaProfile?.showAvatars && image && position ? (
+      {image && position ? (
         <img
           src={image}
           alt=""
@@ -446,6 +505,7 @@ export function ChatPage({
   const [activeId, setActiveId] = useState(() => initialConversationId || readActiveConversationId(conversations) || conversations[0]?.id || "");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [watchSectionOpen, setWatchSectionOpen] = useState(false);
   const [draftTitle, setDraftTitle] = useState("");
   const [input, setInput] = useState(() => readConversationDraft(activeId));
   const [isSending, setIsSending] = useState(false);
@@ -472,6 +532,7 @@ export function ChatPage({
   const [stateCardDraft, setStateCardDraft] = useState("");
   const [stateCardBusy, setStateCardBusy] = useState(false);
   const [stateCardNotice, setStateCardNotice] = useState("");
+  const [openReasoningIds, setOpenReasoningIds] = useState<Set<string>>(() => new Set());
   const [newWindowPanelOpen, setNewWindowPanelOpen] = useState(false);
   const [newWindowSourceId, setNewWindowSourceId] = useState(activeId);
   const [newWindowOptions, setNewWindowOptions] = useState({
@@ -491,6 +552,8 @@ export function ChatPage({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sessionImportInputRef = useRef<HTMLInputElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const streamPreviewFrameRef = useRef<number | null>(null);
+  const streamPreviewPendingRef = useRef<{ conversationId: string; messages: ConversationMessage[] } | null>(null);
   const draftByConversationRef = useRef<Record<string, string>>(readConversationDrafts());
   const previousActiveIdRef = useRef(activeId);
   const shouldAutoFollowScrollRef = useRef(true);
@@ -547,7 +610,7 @@ export function ChatPage({
           });
         });
 
-        hits.sort((a, b) => {
+        const orderedHits = hits.sort((a, b) => {
           const aIsMessage = a.messageId ? 1 : 0;
           const bIsMessage = b.messageId ? 1 : 0;
           if (aIsMessage !== bIsMessage) return aIsMessage - bIsMessage;
@@ -558,18 +621,19 @@ export function ChatPage({
 
         return {
           conversation,
-          hits,
-          hitCount: hits.length,
+          hits: orderedHits.slice(0, 8),
+          hitCount: orderedHits.length,
           isWatchConversation: isWatchConversation(conversation),
-          lastModifiedAt: new Date(conversation.updatedAt || hits[hits.length - 1].createdAt).getTime(),
-          preview: hits[0]?.preview || conversation.messages.at(-1)?.text || "",
+          lastModifiedAt: new Date(conversation.updatedAt || orderedHits[orderedHits.length - 1].createdAt).getTime(),
+          preview: orderedHits[0]?.preview || conversation.messages.at(-1)?.text || "",
         };
       })
       .filter((group): group is ConversationSearchGroup => Boolean(group))
       .sort((a, b) => {
         if (a.isWatchConversation !== b.isWatchConversation) return a.isWatchConversation ? 1 : -1;
         return b.lastModifiedAt - a.lastModifiedAt;
-      });
+      })
+      .slice(0, 50);
   }, [conversations, searchQuery]);
 
   const totalSearchHitCount = useMemo(
@@ -636,6 +700,10 @@ export function ChatPage({
     previousActiveIdRef.current = activeId;
     setInput(draftByConversationRef.current[activeId] ?? readConversationDraft(activeId));
   }, [activeId]);
+
+  useEffect(() => {
+    if (activeConversation && isWatchConversation(activeConversation)) setWatchSectionOpen(true);
+  }, [activeConversation?.id]);
 
   useEffect(() => subscribeSessionContinuity(() => setStateCardVersion((value) => value + 1)), []);
 
@@ -711,6 +779,10 @@ export function ChatPage({
     };
   }, [showAttachmentMenu]);
 
+  useEffect(() => () => {
+    clearPendingStreamPreview();
+  }, []);
+
   function resizeComposer(node = composerRef.current) {
     if (!node) return;
     const maxHeight = COMPOSER_LINE_HEIGHT * COMPOSER_MAX_LINES + 18;
@@ -724,6 +796,41 @@ export function ChatPage({
     const nextConversations = listConversations();
     setConversations(nextConversations);
     setActiveId(nextActiveId || nextConversations[0]?.id || "");
+  }
+
+  function previewConversationMessages(conversationId: string, nextMessages: ConversationMessage[]) {
+    setConversations((current) => {
+      let matched = false;
+      const next = current.map((conversation) => {
+        if (conversation.id !== conversationId) return conversation;
+        matched = true;
+        return { ...conversation, messages: nextMessages };
+      });
+      if (matched) return next;
+
+      const stored = getConversation(conversationId);
+      return stored ? [{ ...stored, messages: nextMessages }, ...next] : next;
+    });
+  }
+
+  function scheduleStreamPreview(conversationId: string, nextMessages: ConversationMessage[]) {
+    streamPreviewPendingRef.current = { conversationId, messages: nextMessages };
+    if (streamPreviewFrameRef.current !== null) return;
+
+    streamPreviewFrameRef.current = window.requestAnimationFrame(() => {
+      streamPreviewFrameRef.current = null;
+      const pending = streamPreviewPendingRef.current;
+      streamPreviewPendingRef.current = null;
+      if (pending) previewConversationMessages(pending.conversationId, pending.messages);
+    });
+  }
+
+  function clearPendingStreamPreview() {
+    if (streamPreviewFrameRef.current !== null) {
+      window.cancelAnimationFrame(streamPreviewFrameRef.current);
+      streamPreviewFrameRef.current = null;
+    }
+    streamPreviewPendingRef.current = null;
   }
 
   function isNearMessageScrollBottom(threshold = 90) {
@@ -757,6 +864,24 @@ export function ChatPage({
     if (Date.now() > programmaticScrollUntilRef.current) {
       shouldAutoFollowScrollRef.current = false;
     }
+  }
+
+  function handleUserMessageScrollIntent(event: WheelEvent<HTMLDivElement> | TouchEvent<HTMLDivElement>) {
+    const maybeWheel = "deltaY" in event ? event : null;
+    if (maybeWheel && maybeWheel.deltaY < 0) {
+      shouldAutoFollowScrollRef.current = false;
+      programmaticScrollUntilRef.current = 0;
+      return;
+    }
+
+    window.setTimeout(() => {
+      if (!isNearMessageScrollBottom(24)) {
+        shouldAutoFollowScrollRef.current = false;
+        programmaticScrollUntilRef.current = 0;
+      } else if (maybeWheel && maybeWheel.deltaY > 0) {
+        shouldAutoFollowScrollRef.current = true;
+      }
+    }, 0);
   }
 
   function handleSelectConversation(id: string) {
@@ -873,9 +998,25 @@ export function ChatPage({
     }));
   }
 
-  function handleExportConversation() {
+  async function handleExportConversation() {
     if (!activeConversation) return;
-    const blob = new Blob([JSON.stringify(activeConversation, null, 2)], { type: "application/json" });
+    const [hydratedConversation] = await hydrateConversationRecords([activeConversation]);
+    const conversation = hydratedConversation || activeConversation;
+    const continuity = exportSessionContinuity();
+    const stateCard = continuity.cards[activeConversation.id] || null;
+    const payload = {
+      schema: "kisera_cottage_conversation_export_v2",
+      app: "Kisera Cottage",
+      exportedAt: new Date().toISOString(),
+      conversation,
+      conversations: [conversation],
+      sessionContinuity: {
+        cards: stateCard ? { [activeConversation.id]: stateCard } : {},
+        handoffs: {},
+      },
+      sessionStateCard: stateCard,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     const safeTitle = (activeConversation.title || "conversation").replace(/[\\/:*?"<>|]+/g, "-").slice(0, 60);
@@ -893,13 +1034,22 @@ export function ChatPage({
     if (!file) return;
     try {
       const payload = JSON.parse(await file.text());
-      const incoming: ConversationRecord[] = Array.isArray(payload)
+      const rawIncoming: unknown[] = Array.isArray(payload)
         ? payload
         : Array.isArray(payload?.conversations)
           ? payload.conversations
-          : payload?.id && Array.isArray(payload?.messages)
-            ? [payload]
-            : [];
+          : Array.isArray(payload?.sessions)
+            ? payload.sessions
+            : payload?.conversation?.id && Array.isArray(payload.conversation.messages)
+              ? [payload.conversation]
+              : payload?.session?.id && Array.isArray(payload.session.messages)
+                ? [payload.session]
+                : payload?.id && Array.isArray(payload?.messages)
+                  ? [payload]
+                  : [];
+      const incoming = rawIncoming
+        .map((item, index) => normalizeConversationRecord(item, index))
+        .filter(Boolean) as ConversationRecord[];
       if (!incoming.length) throw new Error("文件里没有可识别的对话窗口。");
       const inspection = inspectConversationImport(incoming);
       let conflictMode: "merge" | "copy" = "copy";
@@ -908,7 +1058,21 @@ export function ChatPage({
           `检测到 ${inspection.divergentSameId} 个同 ID 但内容不同的窗口。\n\n确定：合并并按消息 ID 去重\n取消：保留为导入副本`,
         ) ? "merge" : "copy";
       }
-      const report = importConversationRecords(incoming, conflictMode);
+      const report = await importConversationRecordsAsync(incoming, conflictMode);
+      const firstSourceId = incoming[0]?.id;
+      const singleStateCard = payload?.sessionStateCard || payload?.stateCard;
+      const sessionContinuity = payload?.sessionContinuity
+        || payload?.continuity?.sessionContinuity
+        || (payload?.continuity?.sessionStateCards
+          ? { cards: payload.continuity.sessionStateCards, handoffs: {} }
+          : null)
+        || (singleStateCard && firstSourceId
+          ? { cards: { [firstSourceId]: singleStateCard }, handoffs: {} }
+          : null);
+      if (sessionContinuity) {
+        importSessionContinuity(sessionContinuity, report.idMap);
+        setStateCardVersion((value) => value + 1);
+      }
       const targetId = report.idMap[incoming[0].id] || listConversations()[0]?.id;
       refresh(targetId || activeId);
       if (window.innerWidth < 760) setSidebarOpen(false);
@@ -1053,19 +1217,86 @@ export function ChatPage({
     baseMessages: ConversationMessage[],
     attachments: ConversationAttachment[] = [],
     onStreamUpdate?: (text: string) => void,
+    onMetaUpdate?: (meta: { thoughts?: string; thoughtsTranslated?: string }) => void,
     signal?: AbortSignal,
+    timeBridgeNow?: Date,
   ) {
     const chroniclePreferences = getChroniclePreferences();
-    const shouldRecallMemory = chroniclePreferences.enableMemoryRecall
-      && shouldRetrieveMemory(userText, { hasAttachments: attachments.length > 0 });
+    const personaAllowsMemory = activePersona?.allowMemory !== false;
+    const personaAllowsChronicles = activePersona?.allowChronicles !== false;
+    const anyPersonaRecallEnabled = personaAllowsMemory || personaAllowsChronicles;
+    const recallGatePassed = shouldRetrieveMemory(userText, { hasAttachments: attachments.length > 0 });
+    const memorySkipReason = !chroniclePreferences.enableMemoryRecall
+      ? "memory_recall_disabled"
+      : !anyPersonaRecallEnabled
+        ? "persona_memory_disabled"
+        : !recallGatePassed
+          ? "memory_recall_gate_skipped"
+          : "";
 
-    const [personaCore, userContext, memories] = await Promise.all([
+    const [personaCore, userContext] = await Promise.all([
       adapters.persona.getPersonaCore(),
       adapters.persona.getUserContext?.() ?? Promise.resolve(""),
-      shouldRecallMemory
-        ? adapters.memory.retrieveRelevant(userText, uplinkSettings.contextLoad.memorySnippetLimit)
-        : Promise.resolve([]),
     ]);
+    const topicScope = activeConversation ? `chat:${activeConversation.id}` : "chat:draft";
+    let memories: MemorySnippet[] = [];
+    if (memorySkipReason && memorySkipReason !== "memory_recall_gate_skipped") {
+      recordContextRetrievalSkip(userText, memorySkipReason, uplinkSettings);
+    } else {
+      const gate = evaluateTopicGate(topicScope, userText, {
+        recallGatePassed,
+        hasAttachments: attachments.length > 0,
+      });
+      const existingSet = getTopicMemorySet(topicScope);
+
+      if (gate.ragAction === "none") {
+        const set = commitTopicMemorySet(topicScope, userText, [], gate);
+        recordContextRetrievalSkip(
+          userText,
+          `topic_gate_rag_action_none:${gate.noRagReason || gate.reason}`,
+          uplinkSettings,
+          topicDebugMeta(gate, set, {
+            topicMemoryHashChangedBecause: "memory_action_none",
+          }),
+        );
+      } else if (gate.ragAction === "reuse" && existingSet?.snippets.length) {
+        const set = commitTopicMemorySet(topicScope, userText, existingSet.snippets, gate) || existingSet;
+        memories = set.snippets;
+        recordContextRetrievalAction(
+          userText,
+          memories,
+          `topic_gate_reuse:${gate.reuseReason || gate.reason}`,
+          uplinkSettings,
+          topicDebugMeta(gate, set, {
+            topicMemoryHashChangedBecause: gate.supplementSkippedReason ? "supplement_throttled_reuse" : "",
+          }),
+        );
+      } else {
+        const retrievalLimit = gate.ragAction === "supplement"
+          ? Math.min(2, uplinkSettings.contextLoad.memorySnippetLimit)
+          : uplinkSettings.contextLoad.memorySnippetLimit;
+        const result = await retrieveMemorySnippetsDetailed(userText, retrievalLimit, uplinkSettings);
+        const retrieved = filterPersonaMemories(result.snippets, personaAllowsMemory, personaAllowsChronicles);
+        const beforeMemoryCount = existingSet?.memoryIds.length || 0;
+        const set = commitTopicMemorySet(topicScope, userText, retrieved, gate);
+        memories = set?.snippets || retrieved;
+        const mergedNewCount = Math.max(0, (set?.memoryIds.length || 0) - beforeMemoryCount);
+        recordContextRetrievalResult(
+          result,
+          uplinkSettings,
+          topicDebugMeta(gate, set, {
+            supplementCandidateCount: gate.ragAction === "supplement" ? retrieved.length : 0,
+            supplementMergedNewCount: gate.ragAction === "supplement" ? mergedNewCount : 0,
+            topicMemoryHashChangedBecause: gate.ragAction === "supplement"
+              ? (mergedNewCount > 0 ? "supplement_new_rows" : "supplement_no_new_rows")
+              : gate.ragAction === "refresh"
+                ? "refresh"
+                : "",
+          }),
+          memories,
+        );
+      }
+    }
     const handoff = getWindowHandoff(activeConversation?.id);
     const continuityContext = handoff?.includeContinuityLine === false
       ? ""
@@ -1088,7 +1319,17 @@ ${currentStateCard.content.trim()}`
       ? `这是上一窗口刚刚聊到的位置，只在这次接续时参考：\n${handoff.content}`
       : "";
     const assembledUserContext = [userContext, continuityContext, stateCardContext, handoffContext].filter(Boolean).join("\n\n");
-    const dynamicContext = buildTimeAwarenessContext(uplinkSettings);
+    const filteredMemories = filterPersonaMemories(memories, personaAllowsMemory, personaAllowsChronicles);
+    const timeBridgeOptions = {
+      messages: baseMessages,
+      stateCard: currentStateCard,
+      continuityLine: handoff?.includeContinuityLine === false ? null : getContinuityLine(),
+      memories: filteredMemories,
+      memoryRecallEnabled: chroniclePreferences.enableMemoryRecall && personaAllowsMemory,
+      chronicleRecallEnabled: chroniclePreferences.enableMemoryRecall && personaAllowsChronicles,
+    };
+    const dynamicContext = buildTimeAwarenessContext(uplinkSettings, timeBridgeOptions, timeBridgeNow || new Date());
+    const timeBridgeMeta = buildTimeBridgeMeta(timeBridgeOptions);
 
     const recentMessages = selectCacheFriendlyWindow(baseMessages, uplinkSettings.contextLoad.shortTermMessageLimit)
       .map((message) => ({
@@ -1105,9 +1346,15 @@ ${currentStateCard.content.trim()}`
       personaCore,
       userContext: assembledUserContext,
       dynamicContext,
-      memories,
+      memories: filteredMemories,
       recentMessages,
+      replyAesthetics: {
+        markdownNarrativeEnabled: uplinkSettings.visual.markdownNarrativeEnabled,
+        emojiFrequency: uplinkSettings.visual.emojiFrequency,
+      },
+      timeBridgeMeta,
       onStreamUpdate,
+      onMetaUpdate,
       signal,
       watch: createEmptyWatchContext(),
     });
@@ -1118,6 +1365,8 @@ ${currentStateCard.content.trim()}`
     rawAttachments: ConversationAttachment[],
     historyPrefix: ConversationMessage[],
     restoreDraftOnError = false,
+    reuseUserMessage?: ConversationMessage,
+    contextNow?: Date,
   ) {
     const text = rawText.trim();
     const attachments = cloneAttachments(rawAttachments);
@@ -1130,56 +1379,87 @@ ${currentStateCard.content.trim()}`
     setEditingContent("");
     setShowAttachmentMenu(false);
 
-    const userMessage: ConversationMessage = {
-      id: `user-${Date.now()}`,
-      role: "user",
-      text: text || "请看附件。",
-      createdAt: new Date().toISOString(),
-      attachments: attachments.length ? attachments : undefined,
-      tokenCount: estimateMessageTokens({ text: text || "请看附件。", attachments }),
-    };
+    const userMessageText = text || "请看附件。";
+    const userMessage: ConversationMessage = reuseUserMessage
+      ? {
+          ...reuseUserMessage,
+          role: "user",
+          text: userMessageText,
+          attachments: attachments.length ? attachments : undefined,
+          tokenCount: estimateMessageTokens({ text: userMessageText, attachments }),
+        }
+      : {
+          id: `user-${Date.now()}`,
+          role: "user",
+          text: userMessageText,
+          createdAt: new Date().toISOString(),
+          attachments: attachments.length ? attachments : undefined,
+          tokenCount: estimateMessageTokens({ text: userMessageText, attachments }),
+        };
     const companionMessage: ConversationMessage = {
       id: `companion-${Date.now()}`,
       role: "companion",
       text: "",
       createdAt: new Date().toISOString(),
     };
+    const conversationId = activeConversation.id;
     const baseMessages = [...historyPrefix, userMessage];
     const optimisticMessages = [...baseMessages, companionMessage];
-    replaceConversationMessages(activeConversation.id, optimisticMessages);
-    refresh(activeConversation.id);
+    replaceConversationMessages(conversationId, optimisticMessages);
+    refresh(conversationId);
 
     let latestStreamedText = "";
+    let latestThoughts = "";
+    let latestThoughtsTranslated = "";
     const abortController = new AbortController();
     abortControllerRef.current?.abort();
     abortControllerRef.current = abortController;
+    const handleMetaUpdate = (meta: { thoughts?: string; thoughtsTranslated?: string }) => {
+      if (typeof meta.thoughts === "string") latestThoughts = meta.thoughts;
+      if (typeof meta.thoughtsTranslated === "string") latestThoughtsTranslated = meta.thoughtsTranslated;
+      scheduleStreamPreview(conversationId, [
+        ...baseMessages,
+        {
+          ...companionMessage,
+          text: latestStreamedText,
+          modelUsed: uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
+          tokenCount: estimateMessageTokens({ text: latestStreamedText }),
+          thoughts: latestThoughts || undefined,
+          thoughtsTranslated: latestThoughtsTranslated || undefined,
+        },
+      ]);
+    };
 
     try {
       const response = await requestCompanion(userMessage.text, baseMessages, attachments, (streamedText) => {
         latestStreamedText = streamedText;
-        replaceConversationMessages(activeConversation.id, [
+        scheduleStreamPreview(conversationId, [
           ...baseMessages,
           {
             ...companionMessage,
             text: streamedText,
             modelUsed: uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
             tokenCount: estimateMessageTokens({ text: streamedText }),
+            thoughts: latestThoughts || undefined,
+            thoughtsTranslated: latestThoughtsTranslated || undefined,
           },
         ]);
-        refresh(activeConversation.id);
-      }, abortController.signal);
+      }, handleMetaUpdate, abortController.signal, contextNow);
       const completedMessages = [
         ...baseMessages,
         {
           ...companionMessage,
           text: response.text,
           modelUsed: response.modelUsed || uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
-          tokenCount: response.tokenCount || estimateMessageTokens({ text: response.text }),
+          tokenCount: estimateMessageTokens({ text: response.text }),
+          thoughts: response.thoughts || latestThoughts || undefined,
+          thoughtsTranslated: response.thoughtsTranslated || latestThoughtsTranslated || undefined,
         },
       ];
-      replaceConversationMessages(activeConversation.id, completedMessages);
-      refresh(activeConversation.id);
-      markWindowHandoffUsed(activeConversation.id);
+      clearPendingStreamPreview();
+      replaceConversationMessages(conversationId, completedMessages);
+      refresh(conversationId);
+      markWindowHandoffUsed(conversationId);
       if (personaProfile) {
         const completedConversation: ConversationRecord = {
           ...activeConversation,
@@ -1212,8 +1492,9 @@ ${currentStateCard.content.trim()}`
       }
     } catch (event) {
       const aborted = event instanceof DOMException && event.name === "AbortError";
+      clearPendingStreamPreview();
       if (aborted) {
-        replaceConversationMessages(activeConversation.id, [
+        replaceConversationMessages(conversationId, [
           ...baseMessages,
           {
             ...companionMessage,
@@ -1223,7 +1504,7 @@ ${currentStateCard.content.trim()}`
           },
         ]);
       } else if (latestStreamedText.trim()) {
-        replaceConversationMessages(activeConversation.id, [
+        replaceConversationMessages(conversationId, [
           ...baseMessages,
           {
             ...companionMessage,
@@ -1233,16 +1514,17 @@ ${currentStateCard.content.trim()}`
           },
         ]);
       } else {
-        replaceConversationMessages(activeConversation.id, historyPrefix);
+        replaceConversationMessages(conversationId, historyPrefix);
       }
       if (restoreDraftOnError && !latestStreamedText.trim()) {
         setInput(rawText);
         setPendingAttachments(attachments);
       }
       if (!aborted) setError(event instanceof Error ? event.message : "对话请求失败。");
-      refresh(activeConversation.id);
+      refresh(conversationId);
     } finally {
       if (abortControllerRef.current === abortController) abortControllerRef.current = null;
+      clearPendingStreamPreview();
       setIsSending(false);
     }
   }
@@ -1275,7 +1557,16 @@ ${currentStateCard.content.trim()}`
     const userIndex = companionIndex - 1;
     const previousUser = messages[userIndex];
     if (!previousUser || previousUser.role !== "user") return;
-    await submitUserMessage(previousUser.text, previousUser.attachments ?? [], messages.slice(0, userIndex));
+    const previousCompanion = messages[companionIndex];
+    const contextNow = previousCompanion?.createdAt ? new Date(previousCompanion.createdAt) : undefined;
+    await submitUserMessage(
+      previousUser.text,
+      previousUser.attachments ?? [],
+      messages.slice(0, userIndex),
+      false,
+      previousUser,
+      contextNow && !Number.isNaN(contextNow.getTime()) ? contextNow : undefined,
+    );
   }
 
   async function handleRegenerate() {
@@ -1386,8 +1677,8 @@ ${currentStateCard.content.trim()}`
             <p>ARCHIVES</p>
             <h1>长对话</h1>
           </div>
-          <button type="button" onClick={() => setSidebarOpen(false)} title="收起侧边栏">
-            <PanelLeftClose size={17} />
+          <button type="button" className="cottage-sidebar-close" onClick={() => setSidebarOpen(false)} title="收起窗口列表" aria-label="收起窗口列表">
+            <X size={14} strokeWidth={1.7} />
           </button>
         </div>
 
@@ -1602,7 +1893,29 @@ ${currentStateCard.content.trim()}`
             </>
           ) : (
             <>
-              {sortedConversations.map(renderConversationItem)}
+              {dailyConversations.map(renderConversationItem)}
+              {watchConversations.length > 0 && (
+                <section className="cottage-session-section">
+                  <button
+                    type="button"
+                    className="cottage-session-section-toggle"
+                    onClick={() => setWatchSectionOpen((value) => !value)}
+                    aria-expanded={watchSectionOpen}
+                  >
+                    <span>
+                      <Clapperboard size={14} />
+                      观影室对话
+                      <em>{watchConversations.length}</em>
+                    </span>
+                    {watchSectionOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  </button>
+                  {watchSectionOpen && (
+                    <div className="cottage-session-section-list">
+                      {watchConversations.map(renderConversationItem)}
+                    </div>
+                  )}
+                </section>
+              )}
               {!sortedConversations.length && (
                 <div className="cottage-session-empty">还没有对话窗口</div>
               )}
@@ -1615,9 +1928,10 @@ ${currentStateCard.content.trim()}`
         <header className="cottage-chat-hud">
           <button
             type="button"
-            className="cottage-sidebar-toggle"
+            className={`cottage-sidebar-toggle ${sidebarOpen ? "is-open" : ""}`}
             onClick={() => setSidebarOpen((value) => !value)}
-            title="展开会话列表"
+            title={sidebarOpen ? "收起侧栏" : "展开会话列表"}
+            aria-label={sidebarOpen ? "收起侧栏" : "展开会话列表"}
           >
             <span className="cottage-sidebar-toggle-bars" aria-hidden="true">
               <i />
@@ -1643,7 +1957,13 @@ ${currentStateCard.content.trim()}`
           </div>
         </header>
 
-        <div className="cottage-message-scroll" ref={messageListRef} onScroll={handleMessageScroll}>
+        <div
+          className="cottage-message-scroll"
+          ref={messageListRef}
+          onScroll={handleMessageScroll}
+          onWheelCapture={handleUserMessageScrollIntent}
+          onTouchMove={handleUserMessageScrollIntent}
+        >
           {!messages.length && (
             <div className="cottage-empty-chat">
               <Database size={30} />
@@ -1672,6 +1992,62 @@ ${currentStateCard.content.trim()}`
             >
               <MessageAvatar role={message.role} personaProfile={personaProfile} />
               <div className="cottage-message-stack">
+                {message.role === "companion" && (!!message.thoughts || !!message.thoughtsTranslated) ? (() => {
+                  const reasoningOpen = openReasoningIds.has(message.id);
+                  const setReasoningOpen = (open: boolean) => {
+                    setOpenReasoningIds((current) => {
+                      const next = new Set(current);
+                      if (open) next.add(message.id);
+                      else next.delete(message.id);
+                      return next;
+                    });
+                  };
+
+                  return (
+                  <div className={`cottage-reasoning-chip ${reasoningOpen ? "is-open" : ""}`}>
+                    <button
+                      type="button"
+                      className="cottage-reasoning-summary"
+                      data-sfx="hotspot"
+                      aria-expanded={reasoningOpen}
+                      onClick={() => setReasoningOpen(!reasoningOpen)}
+                    >
+                      <svg
+                        className="cottage-reasoning-icon"
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 14 14"
+                        width="28"
+                        height="28"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <circle cx="7" cy="7" r="4.5" stroke="var(--interactive-accent, #dcbda8)" strokeWidth="0.85" fill="none" />
+                        <line x1="7" y1="1" x2="7" y2="13" stroke="var(--interactive-accent, #dcbda8)" strokeWidth="0.5" opacity="0.6" />
+                        <line x1="1" y1="7" x2="13" y2="7" stroke="var(--interactive-accent, #dcbda8)" strokeWidth="0.5" opacity="0.6" />
+                        <path d="M7 1 C7 4.3 9.3 6.5 12.5 7 C9.3 7.5 7 9.7 7 13 C7 9.7 4.7 7.5 1.5 7 C4.7 6.5 7 4.3 7 1 Z" fill="var(--text-accent, #a694bc)" />
+                        <circle cx="7" cy="7" r="1" fill="#FFF" />
+                      </svg>
+                      <span>thinking</span>
+                    </button>
+                    <div
+                      className="cottage-reasoning-body"
+                      role="button"
+                      tabIndex={reasoningOpen ? 0 : -1}
+                      aria-hidden={!reasoningOpen}
+                      onClick={() => setReasoningOpen(false)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setReasoningOpen(false);
+                        }
+                      }}
+                    >
+                      {message.thoughtsTranslated && <pre>{message.thoughtsTranslated}</pre>}
+                      {message.thoughts && <pre className={message.thoughtsTranslated ? "raw" : ""}>{message.thoughts}</pre>}
+                    </div>
+                  </div>
+                  );
+                })() : null}
                 <div className={`cottage-message-card ${editingMessageId === message.id ? "is-editing" : ""}`}>
                   {!!message.attachments?.length && (
                     <div className="cottage-message-attachments">

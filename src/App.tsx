@@ -8,9 +8,11 @@ import { CottageLogoMark } from "./components/CottageGlyphs";
 import { MemoryBankPage } from "./components/MemoryBankPage";
 import { PersonaCorePage } from "./components/PersonaCorePage";
 import { SettingsPage } from "./components/SettingsPage";
+import { SystemSfx } from "./components/SystemSfx";
 import { VectorLabPage } from "./components/VectorLabPage";
 import { TimeCorridorPage } from "./components/TimeCorridorPage";
 import { applyAutomaticVectorProfile, loadUplinkSettings, saveUplinkSettings } from "./settings/uplinkSettings";
+import { createFullBackup, downloadBackup, recordFullBackupPrompt, shouldPromptFullBackup } from "./storage/fullBackup";
 import { getActivePersona, loadPersonaProfile, savePersonaProfile, type PersonaProfile } from "./storage/personaProfile";
 import type { UplinkSettings } from "./types";
 
@@ -22,6 +24,7 @@ interface BeforeInstallPromptEvent extends Event {
 }
 
 const INSTALL_BANNER_DISMISSED_KEY = "ki_co_install_banner_dismissed_v1";
+const FULL_BACKUP_REMINDER_DELAY_MS = 2500;
 
 function NavMemoryGlyph({ size = 20, className = "" }: { size?: number; className?: string }) {
   return (
@@ -139,6 +142,28 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const timer = window.setTimeout(() => {
+      if (!shouldPromptFullBackup()) return;
+      recordFullBackupPrompt();
+      const confirmed = window.confirm(
+        "KI-CO 已经超过 5 天没有做全量备份了。\n\n现在导出一份完整备份吗？\n会包含对话、记忆、日记、生活线、设置和索引；API Key 不会写进备份。"
+      );
+      if (!confirmed) return;
+      void (async () => {
+        const dateLabel = new Date().toISOString().slice(0, 10);
+        downloadBackup(
+          `KISERA_COTTAGE_FULL_BACKUP_${dateLabel}.json`,
+          await createFullBackup(uplinkSettings, personaProfile),
+          "auto-reminder",
+        );
+      })();
+    }, FULL_BACKUP_REMINDER_DELAY_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [personaProfile, uplinkSettings]);
+
   async function installPwa() {
     if (!installPromptEvent) return;
     await installPromptEvent.prompt();
@@ -209,6 +234,7 @@ export default function App() {
 
   return (
     <>
+      <SystemSfx />
       <div style={{ display: activePage === "cinema" ? "block" : "none" }} aria-hidden={activePage !== "cinema"}>
         <CinemaCompanionRoom
           adapters={adapters}

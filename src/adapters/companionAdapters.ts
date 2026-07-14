@@ -59,8 +59,45 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil((text || "").length / 3));
 }
 
-const CLAUDE_CACHE_CONTROL = { type: "ephemeral" } as const;
+type ClaudeResolvedCacheTtl = "5m" | "1h";
+
+const CLAUDE_DEFAULT_CACHE_CONTROL = { type: "ephemeral" } as const;
 const CLAUDE_DEFAULT_MIN_CACHE_TOKENS = 1024;
+const CLAUDE_AUTO_LONG_GAP_MS = 8 * 60 * 1000;
+
+const claudeAutoTtlLocks = new Map<string, { ttl: ClaudeResolvedCacheTtl; updatedAt: number }>();
+
+function getClaudeCacheControl(ttl: ClaudeResolvedCacheTtl) {
+  return ttl === "1h" ? { type: "ephemeral", ttl: "1h" } as const : CLAUDE_DEFAULT_CACHE_CONTROL;
+}
+
+function resolveClaudeCacheTtl(settings: UplinkSettings, request: CompanionRequest): ClaudeResolvedCacheTtl {
+  const channel = request.channel || "chat";
+  const mode = settings.claudeCacheTtlMode || "auto";
+  if (channel !== "chat" || request.mode === "plan") return "5m";
+  if (mode === "5m" || mode === "1h") return mode;
+
+  const previousGapMs = Number(request.timeBridgeMeta?.previousUserGapMs || 0);
+  const averageGapMs = Number(request.timeBridgeMeta?.recentUserAverageGapMs || 0);
+  const lockKey = request.cacheScope || "global-chat";
+  const existing = claudeAutoTtlLocks.get(lockKey);
+
+  if (existing && previousGapMs > 0 && previousGapMs <= CLAUDE_AUTO_LONG_GAP_MS) {
+    existing.updatedAt = Date.now();
+    return existing.ttl;
+  }
+
+  const ttl: ClaudeResolvedCacheTtl =
+    previousGapMs > CLAUDE_AUTO_LONG_GAP_MS || averageGapMs > CLAUDE_AUTO_LONG_GAP_MS
+      ? "1h"
+      : "5m";
+  claudeAutoTtlLocks.set(lockKey, { ttl, updatedAt: Date.now() });
+  return ttl;
+}
+
+function formatClaudeCacheTtlForDebug(ttl: ClaudeResolvedCacheTtl): string {
+  return ttl === "1h" ? "1h" : "default_5m";
+}
 
 function getMaxOutputTokens(settings: UplinkSettings, request: CompanionRequest): number {
   // A cinema plan is a one-shot JSON document with many timed points. A low
@@ -109,6 +146,33 @@ function renderStableMemory(memory: MemorySnippet): string {
     .join("\n");
 }
 
+function buildReplyAestheticInstruction(request: CompanionRequest): string {
+  const markdownNarrativeEnabled = request.replyAesthetics?.markdownNarrativeEnabled === true;
+  const emojiFrequency = request.replyAesthetics?.emojiFrequency || "off";
+  const emojiInstruction =
+    emojiFrequency === "off"
+      ? ""
+      : emojiFrequency === "medium"
+        ? "Emoji Frequency: medium. Use emojis at moderate density, only when tone fits."
+        : emojiFrequency === "high"
+          ? "Emoji Frequency: high. You may use emojis frequently when emotionally appropriate; avoid spam."
+          : "Emoji Frequency: low. Use emojis sparingly， only when naturally fitting the tone.";
+
+  if (markdownNarrativeEnabled) {
+    return `=== [SYSTEM OVERRIDE: FORMAT RESET] ===
+Use natural conversational text and tasteful Markdown layering when appropriate.
+Markdown headings/lists/quotes/dividers are allowed when helpful for clarity and rhythm.
+Stay in persona.
+Current Mode: Enhanced Narrative. Use full Markdown formatting as per the current active persona's aesthetic protocol.
+You may occasionally use blockquotes (>) for inner monologue and horizontal rules (---) for scene transitions when it feels natural; do not force a template.${emojiInstruction ? `\n${emojiInstruction}` : ""}`;
+  }
+
+  return `=== [SYSTEM OVERRIDE: FORMAT RESET] ===
+Use natural conversational text.
+Stay in persona.
+Current Mode: Clean Text. Use natural conversation without heavy formatting.${emojiInstruction ? `\n${emojiInstruction}` : ""}`;
+}
+
 function formatStableMemories(memories: MemorySnippet[], cacheScope?: string): string {
   const byId = new Map(memories.map((memory) => [memory.id, memory]));
   const priorIds = cacheScope ? memoryOrderByScope.get(cacheScope) ?? [] : [];
@@ -133,8 +197,6 @@ function formatStableMemories(memories: MemorySnippet[], cacheScope?: string): s
 }
 
 function stablePromptPrefixForCache(request: CompanionRequest): string {
-  const userContext = request.userContext ? `\nUser context:\n${request.userContext}` : "";
-
   if (request.mode === "plan") {
     return [
       "You are generating a cinema companion plan for a co-watching room.",
@@ -143,7 +205,6 @@ function stablePromptPrefixForCache(request: CompanionRequest): string {
       "",
       "Persona core:",
       request.personaCore,
-      userContext,
     ]
       .filter(Boolean)
       .join("\n");
@@ -152,10 +213,10 @@ function stablePromptPrefixForCache(request: CompanionRequest): string {
   if (request.mode === "chat") {
     return [
       "You are an AI companion whose continuity is guided by the user's persona core and memory notes.",
+      visibleReasoningStyleBlock(),
       "",
       "Persona core:",
       request.personaCore,
-      userContext,
     ]
       .filter(Boolean)
       .join("\n");
@@ -167,10 +228,10 @@ function stablePromptPrefixForCache(request: CompanionRequest): string {
       "Use the provided co-watching prompt as the current user request. Keep the answer natural, specific, and present in the movie moment.",
       "Let the movie belong to itself first. If this moment truly touches the user, memories, or shared context, bring that in naturally; do not force every answer into personal history or relationship parallels.",
       "Keep the breathing rhythm of the current scene: sometimes a short aside is enough, sometimes the user may want deeper analysis.",
+      visibleReasoningStyleBlock(),
       "",
       "Persona core:",
       request.personaCore,
-      userContext,
     ]
       .filter(Boolean)
       .join("\n");
@@ -181,13 +242,35 @@ function stablePromptPrefixForCache(request: CompanionRequest): string {
     "Use the persona core as a continuity anchor, but let the current movie moment and current user request lead the answer.",
     "Let the movie belong to itself first. If this moment truly touches the user, memories, or shared context, bring that in naturally; do not force every answer into personal history or relationship parallels.",
     "Keep the breathing rhythm of the current scene: sometimes a short aside is enough, sometimes the user may want deeper analysis.",
+    visibleReasoningStyleBlock(),
     "",
     "Persona core:",
     request.personaCore,
-    userContext,
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+const VISIBLE_REASONING_STYLE_RULES = [
+  "Visible reasoning/thoughts style:",
+  "思考时可以参考 persona core、状态卡、记忆、日记和召回内容等背景信息，但不需要在思考中逐项罗列“根据XXX”。除非用户正在调试小屋机制、缓存、prompt 或召回，否则自然判断就好。",
+].join("\n");
+
+function visibleReasoningStyleBlock(): string {
+  return VISIBLE_REASONING_STYLE_RULES;
+}
+
+function extractPromptName(source: string | undefined, field: "User name" | "Companion name", fallback: string): string {
+  const match = String(source || "").match(new RegExp(`^${field}:\\s*(.+)$`, "mi"));
+  const raw = (match?.[1] || fallback).replace(/\s+/g, " ").trim();
+  return raw || fallback;
+}
+
+function promptSpeakerLabels(request: CompanionRequest): { userLabel: string; companionLabel: string } {
+  return {
+    userLabel: extractPromptName(`${request.userContext || ""}\n${request.personaCore || ""}`, "User name", "User"),
+    companionLabel: extractPromptName(request.personaCore, "Companion name", "Companion"),
+  };
 }
 
 function splitPromptForClaudeCache(request: CompanionRequest, promptPreview: string): { stablePrefix: string; dynamicTail: string } | null {
@@ -206,6 +289,10 @@ function estimateClaudeCacheTokens(text: string): number {
     weighted += ch.charCodeAt(0) > 127 ? 1 : 0.28;
   }
   return Math.max(0, Math.ceil(weighted));
+}
+
+function isClaudeNamedModel(model: string): boolean {
+  return /\b(anthropic|claude|sonnet|opus|haiku)\b/i.test(String(model || "").replace(/[/:_.-]+/g, " "));
 }
 
 function isClaudeOpusModel(model: string): boolean {
@@ -246,6 +333,7 @@ function buildClaudePromptCachePlan(
   model: string,
 ): {
   stablePrefix: string;
+  stableContext: string;
   dynamicTail: string;
   cacheStrategy?: string;
   cacheablePrefixTokens?: number;
@@ -254,42 +342,51 @@ function buildClaudePromptCachePlan(
   const base = splitPromptForClaudeCache(request, promptPreview);
   if (!base) return null;
 
-  let { stablePrefix, dynamicTail } = base;
+  const { stablePrefix } = base;
+  let { dynamicTail } = base;
   const minTokens = getClaudeCacheMinTokens(model);
   const stablePrefixTokens = estimateClaudeCacheTokens(stablePrefix);
   const shouldTryStableExpansion = minTokens > CLAUDE_DEFAULT_MIN_CACHE_TOKENS && stablePrefixTokens < minTokens;
-  let cacheStrategy = shouldTryStableExpansion
-    ? "claude-high-threshold-stable-prefix"
-    : "claude-stable-prefix";
+  const contextEndHeaders = [
+    "\nRelevant memories:",
+    "\nDynamic context:",
+    "\nRecent conversation:",
+    "\nCurrent attachments:",
+    "\nPlan request:",
+    "\nMovie:",
+    "\nSubtitle window:",
+    "\nUser says:",
+    "\nReturn only",
+    "\nAnswer ",
+    "\n=== [SYSTEM OVERRIDE:",
+  ];
+  const memoryEndHeaders = contextEndHeaders.filter((header) => header !== "\nRelevant memories:");
+  const userContext = extractPromptSection(dynamicTail, "User context:", contextEndHeaders);
+  const relevantMemories = extractPromptSection(dynamicTail, "Relevant memories:", memoryEndHeaders);
+  const stableContext = [userContext, relevantMemories].filter(Boolean).join("\n\n");
 
-  if (shouldTryStableExpansion) {
-    // Relevant memories are rendered before recent conversation/current input,
-    // and should stay free of scores, timings, and dynamic hit explanations.
-    const relevantMemories = extractPromptSection(dynamicTail, "Relevant memories:", [
-      "\nDynamic context:",
-      "\nRecent conversation:",
-      "\nCurrent attachments:",
-      "\nPlan request:",
-      "\nMovie:",
-      "\nSubtitle window:",
-      "\nUser says:",
-      "\nReturn only",
-      "\nAnswer ",
-    ]);
-    if (relevantMemories) {
-      stablePrefix = `${stablePrefix}\n\n${relevantMemories}`;
-      dynamicTail = removePromptSection(dynamicTail, relevantMemories);
-      cacheStrategy = estimateClaudeCacheTokens(stablePrefix) >= minTokens
-        ? "claude-high-threshold-expanded-prefix"
-        : "claude-high-threshold-expanded-prefix-below-minimum";
-    }
-  }
+  if (userContext) dynamicTail = removePromptSection(dynamicTail, userContext);
+  if (relevantMemories) dynamicTail = removePromptSection(dynamicTail, relevantMemories);
+
+  const layeredTokens = estimateClaudeCacheTokens(
+    [stablePrefix, stableContext].filter(Boolean).join("\n\n"),
+  );
+  const cacheStrategy = stableContext
+    ? shouldTryStableExpansion
+      ? layeredTokens >= minTokens
+        ? "claude-high-threshold-layered-context"
+        : "claude-high-threshold-layered-context-below-minimum"
+      : "claude-stable-prefix+layered-context"
+    : shouldTryStableExpansion
+      ? "claude-high-threshold-stable-prefix"
+      : "claude-stable-prefix";
 
   return {
     stablePrefix,
+    stableContext,
     dynamicTail,
     cacheStrategy,
-    cacheablePrefixTokens: estimateClaudeCacheTokens(stablePrefix),
+    cacheablePrefixTokens: layeredTokens,
     cacheablePrefixMinTokens: minTokens,
   };
 }
@@ -297,7 +394,7 @@ function buildClaudePromptCachePlan(
 function isClaudeLikeProfile(provider: ModelProvider, profile: ProviderProfile): boolean {
   const model = String(profile.model || "");
   const baseUrl = String(profile.baseUrl || "");
-  return provider === "claude" || /(^|[/:_-])(anthropic|claude)([/:_.-]|$)/i.test(model) || isClaudeOpusModel(model) || /anthropic\.com/i.test(baseUrl);
+  return provider === "claude" || isClaudeNamedModel(model) || /anthropic\.com/i.test(baseUrl);
 }
 
 function shouldRetryWithoutPromptCache(errorText: string): boolean {
@@ -333,18 +430,38 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
   }
 
   if (request.mode === "chat") {
+    if (request.channel === "journal") {
+      return [
+        "You are writing a private chronicle in-character, natural and intimate, never like a system log.",
+        "Return only the chronicle body and the final tag line requested by the user.",
+        "Do not output headings, titles, separators, JSON, Markdown fences, or labels like \"Chronicle Entry\".",
+        "",
+        "Persona core:",
+        request.personaCore,
+        request.userContext ? `\nUser context:\n${request.userContext}` : "",
+        "",
+        "Journal request:",
+        request.userMessage,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
     const memories = formatStableMemories(request.memories, request.cacheScope);
+    const { userLabel, companionLabel } = promptSpeakerLabels(request);
 
     const recentMessages = request.recentMessages
       ?.map((message) => {
         const attachmentNote = message.attachments?.length ? ` [attachments: ${message.attachments.length}]` : "";
-        return `${message.role === "user" ? "User" : "Companion"}${attachmentNote}: ${message.text}`;
+        return `${message.role === "user" ? userLabel : companionLabel}${attachmentNote}: ${message.text}`;
       })
       .join("\n");
     const attachments = attachmentPromptBlock(request.attachments);
+    const replyAesthetics = buildReplyAestheticInstruction(request);
 
     return [
       "You are an AI companion whose continuity is guided by the user's persona core and memory notes.",
+      visibleReasoningStyleBlock(),
       "",
       "Persona core:",
       request.personaCore,
@@ -353,8 +470,9 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
       request.dynamicContext ? `\nDynamic context:\n${request.dynamicContext}` : "",
       recentMessages ? `\nRecent conversation:\n${recentMessages}` : "",
       attachments ? `\nCurrent attachments:\n${attachments}` : "",
+      replyAesthetics ? `\n${replyAesthetics}` : "",
       "",
-      `User says: ${request.userMessage}`,
+      `${userLabel} says: ${request.userMessage}`,
       "",
       "Answer in the user's language by default. Use memories as background; if old memories conflict with current facts, follow the current conversation.",
     ]
@@ -364,9 +482,11 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
 
   if (request.mode === "watchPrompt") {
     const memories = formatStableMemories(request.memories, request.cacheScope);
+    const replyAesthetics = buildReplyAestheticInstruction(request);
+    const { userLabel, companionLabel } = promptSpeakerLabels(request);
 
     const recentMessages = request.recentMessages
-      ?.map((message) => `${message.role === "user" ? "User" : "Companion"}: ${message.text}`)
+      ?.map((message) => `${message.role === "user" ? userLabel : companionLabel}: ${message.text}`)
       .join("\n");
 
     return [
@@ -374,6 +494,7 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
       "Use the provided co-watching prompt as the current user request. Keep the answer natural, specific, and present in the movie moment.",
       "Let the movie belong to itself first. If this moment truly touches the user, memories, or shared context, bring that in naturally; do not force every answer into personal history or relationship parallels.",
       "Keep the breathing rhythm of the current scene: sometimes a short aside is enough, sometimes the user may want deeper analysis.",
+      visibleReasoningStyleBlock(),
       "",
       "Persona core:",
       request.personaCore,
@@ -381,6 +502,7 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
       memories ? `\nRelevant memories:\n${memories}` : "",
       request.dynamicContext ? `\nDynamic context:\n${request.dynamicContext}` : "",
       recentMessages ? `\nRecent conversation:\n${recentMessages}` : "",
+      replyAesthetics ? `\n${replyAesthetics}` : "",
       "",
       request.userMessage,
     ]
@@ -398,9 +520,11 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
     .join("\n");
 
   const memories = formatStableMemories(request.memories, request.cacheScope);
+  const replyAesthetics = buildReplyAestheticInstruction(request);
+  const { userLabel, companionLabel } = promptSpeakerLabels(request);
 
   const recentMessages = request.recentMessages
-    ?.map((message) => `${message.role === "user" ? "User" : "Companion"}: ${message.text}`)
+    ?.map((message) => `${message.role === "user" ? userLabel : companionLabel}: ${message.text}`)
     .join("\n");
 
   return [
@@ -408,6 +532,7 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
     "Use the persona core as a continuity anchor, but let the current movie moment and current user request lead the answer.",
     "Let the movie belong to itself first. If this moment truly touches the user, memories, or shared context, bring that in naturally; do not force every answer into personal history or relationship parallels.",
     "Keep the breathing rhythm of the current scene: sometimes a short aside is enough, sometimes the user may want deeper analysis.",
+    visibleReasoningStyleBlock(),
     "",
     "Persona core:",
     request.personaCore,
@@ -415,13 +540,14 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
     memories ? `\nRelevant memories:\n${memories}` : "",
     request.dynamicContext ? `\nDynamic context:\n${request.dynamicContext}` : "",
     recentMessages ? `\nRecent conversation:\n${recentMessages}` : "",
+    replyAesthetics ? `\n${replyAesthetics}` : "",
     "",
     `Movie: ${watch.title || "Untitled"}`,
     `Current time: ${formatTime(watch.currentTime)} / ${formatTime(watch.duration)}`,
     subtitleContext ? `\nSubtitle window:\n${subtitleContext}` : "\nSubtitle window: none",
     watch.screenshotDataUrl ? "\nA screenshot from the current frame is attached in the host app." : "",
     "",
-    `User says: ${request.userMessage}`,
+    `${userLabel} says: ${request.userMessage}`,
     "",
     "Answer naturally as a co-watching companion. Use the persona core as background, not a script. Avoid template-like film criticism unless the user asks for analysis.",
   ]
@@ -505,7 +631,7 @@ function resolvePromptCacheProvider(provider: ModelProvider, profile: ProviderPr
     return "deepseek" as const;
   }
   if (provider === "gemini") return "gemini" as const;
-  if (provider === "claude" || model.includes("claude") || model.includes("anthropic") || model.includes("opus")) return "claude" as const;
+  if (provider === "claude" || isClaudeNamedModel(model)) return "claude" as const;
   return providerToPromptCacheProvider(provider);
 }
 
@@ -528,6 +654,134 @@ function extractTextFromOpenAICompatible(payload: any): string {
   return payload?.choices?.[0]?.text || "";
 }
 
+function extractTextPart(value: any): string {
+  if (typeof value === "string") return value;
+  if (!value) return "";
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => part?.text || part?.content || part?.delta?.text || "")
+      .filter(Boolean)
+      .join("");
+  }
+  if (typeof value === "object") {
+    return value.text || value.content || value.delta?.text || "";
+  }
+  return "";
+}
+
+function extractStreamTextDelta(payload: any): string {
+  const choice = payload?.choices?.[0];
+  const delta = choice?.delta;
+  return extractTextPart(delta?.content)
+    || extractTextPart(delta?.text)
+    || extractTextPart(choice?.text)
+    || extractTextPart(payload?.delta?.text)
+    || extractTextPart(payload?.content_block_delta?.delta?.text);
+}
+
+const REASONING_TRANSLATION_PENDING_TEXT = "翻译中...";
+const REASONING_TRANSLATION_TIMEOUT_TEXT = "（翻译超时，已保留原文）";
+const REASONING_TRANSLATION_TIMEOUT_MS = 120000;
+const OPENROUTER_APP_HEADERS = {
+  "HTTP-Referer": "https://ki-co.local",
+  "X-Title": "KI-CO Cottage",
+} as const;
+
+function openRouterAppHeadersForBase(baseUrl: string): Record<string, string> {
+  return /openrouter\.ai/i.test(String(baseUrl || "")) ? { ...OPENROUTER_APP_HEADERS } : {};
+}
+
+function mergeReasoningText(current: string, incoming: string): string {
+  const next = (incoming || "").trim();
+  if (!next) return current;
+  if (!current) return next;
+  const norm = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase();
+  const currentNorm = norm(current);
+  const nextNorm = norm(next);
+  if (!nextNorm || nextNorm === currentNorm) return current;
+  if (nextNorm.startsWith(currentNorm)) return next;
+  if (currentNorm.startsWith(nextNorm) && nextNorm.length > 24) return current;
+
+  const maxOverlap = Math.min(current.length, next.length, 200);
+  for (let size = maxOverlap; size >= 12; size -= 1) {
+    if (current.slice(-size).toLowerCase() === next.slice(0, size).toLowerCase()) {
+      return `${current}${next.slice(size)}`.replace(/\s+/g, " ").trim();
+    }
+  }
+
+  const tail = current[current.length - 1] || "";
+  const head = next[0] || "";
+  const needsSpace = /[A-Za-z0-9]/.test(tail) && /[A-Za-z0-9]/.test(head);
+  return `${current}${needsSpace ? " " : ""}${next}`.replace(/\s+/g, " ").trim();
+}
+
+function compactReasoningChunks(chunks: string[]): string {
+  const ordered: string[] = [];
+  const norm = (value: string) => value.replace(/\s+/g, " ").trim().toLowerCase();
+
+  for (const raw of chunks) {
+    const item = String(raw || "").replace(/\s+/g, " ").trim();
+    if (!item) continue;
+    if (!ordered.length) {
+      ordered.push(item);
+      continue;
+    }
+
+    const last = ordered[ordered.length - 1];
+    const lastNorm = norm(last);
+    const itemNorm = norm(item);
+    if (itemNorm === lastNorm) continue;
+    if (itemNorm.startsWith(lastNorm) && lastNorm.length >= 12) {
+      ordered[ordered.length - 1] = item;
+      continue;
+    }
+    if (lastNorm.startsWith(itemNorm) && itemNorm.length >= 12) continue;
+    ordered.push(item);
+  }
+
+  return ordered.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function extractReasoningText(obj: any): string {
+  if (!obj) return "";
+  const chunks: string[] = [];
+  const direct = [
+    obj.reasoning,
+    obj.reasoning_content,
+    obj.reasoningContent,
+    obj.reasoning_summary,
+    obj.reasoningSummary,
+    obj.thoughts,
+    obj.thought,
+    obj.thinking,
+  ];
+  for (const item of direct) {
+    if (typeof item === "string" && item.trim()) chunks.push(item.trim());
+  }
+
+  const details = obj.reasoning_details || obj.reasoningDetails || obj.reasoning?.details || [];
+  if (Array.isArray(details)) {
+    for (const item of details) {
+      if (typeof item === "string" && item.trim()) {
+        chunks.push(item.trim());
+      } else if (item && typeof item === "object") {
+        for (const key of ["text", "summary", "content", "thinking"]) {
+          if (typeof item[key] === "string" && item[key].trim()) chunks.push(item[key].trim());
+        }
+      }
+    }
+  }
+
+  return compactReasoningChunks(chunks);
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => window.setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms`)), timeoutMs)),
+  ]);
+}
+
 async function requestJson(url: string, init: RequestInit): Promise<any> {
   const response = await fetch(url, init);
   const text = await response.text();
@@ -548,6 +802,10 @@ function shouldRetryWithoutStreamUsage(errorText: string): boolean {
   return /stream_options|include_usage|unknown parameter|unsupported|unrecognized|extra field|invalid field/i.test(errorText);
 }
 
+function shouldRetryWithoutReasoning(errorText: string): boolean {
+  return /include_reasoning|reasoning|reasoning_content|thinking|thoughts|unknown parameter|unsupported|unrecognized|extra field|invalid field/i.test(errorText);
+}
+
 function shouldRetryWithoutImages(errorText: string): boolean {
   return /unsupported content type|image_url|vision|multimodal|image input|content type/i.test(errorText);
 }
@@ -561,23 +819,116 @@ function pickBetterUsage(current: any, next: any): any {
   return nextScore >= currentScore ? next : current;
 }
 
+async function translateReasoningToChinese(
+  settings: UplinkSettings,
+  reasoningText: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const source = (reasoningText || "").trim();
+  if (!source) return "";
+
+  const { provider, profile } = getJournalProfile(settings);
+  const apiKey = String(profile.apiKey || "").trim();
+  const model = String(profile.journalModel || profile.model || "").trim();
+  if (!apiKey || !model) return source;
+
+  const prompt = `请把下面这段思考链自然地翻译成中文即可，保留人名和专有名词，不要扩写，不要解释。
+
+[原文]
+${source}`;
+
+  try {
+    if (provider === "gemini") {
+      const endpoint = `${trimTrailingSlash(profile.baseUrl)}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const payload = await requestJson(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 2048 },
+        }),
+        signal,
+      });
+      return payload?.candidates?.[0]?.content?.parts
+        ?.map((part: any) => part?.text || "")
+        .filter(Boolean)
+        .join("\n")
+        .trim() || source;
+    }
+
+    if (provider === "claude") {
+      const endpoint = `${trimTrailingSlash(profile.baseUrl)}/messages`;
+      const payload = await requestJson(endpoint, {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 2048,
+          temperature: 0.1,
+          messages: [{ role: "user", content: prompt }],
+        }),
+        signal,
+      });
+      return Array.isArray(payload?.content)
+        ? payload.content.map((part: any) => part?.text || "").filter(Boolean).join("\n").trim() || source
+        : source;
+    }
+
+    const payload = await requestJson(`${trimTrailingSlash(profile.baseUrl)}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...openRouterAppHeadersForBase(profile.baseUrl),
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: "You are a precise translator." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.1,
+        max_tokens: 2048,
+        stream: false,
+      }),
+      signal,
+    });
+    return extractTextFromOpenAICompatible(payload).trim() || source;
+  } catch {
+    return source;
+  }
+}
+
 async function readOpenAICompatibleStream(
   response: Response,
   onStreamUpdate?: (text: string) => void,
-): Promise<{ text: string; usage?: any; model?: string }> {
+  onMetaUpdate?: (meta: { thoughts?: string }) => void,
+): Promise<{ text: string; usage?: any; model?: string; thoughts?: string }> {
   const reader = response.body?.getReader();
   if (!reader) {
     const payload = await response.json().catch(() => ({}));
+    const message = payload?.choices?.[0]?.message;
+    const thoughts = compactReasoningChunks([
+      extractReasoningText(message),
+      extractReasoningText(payload?.choices?.[0]),
+      extractReasoningText(payload),
+    ]);
     return {
       text: extractTextFromOpenAICompatible(payload),
       usage: payload?.usage,
       model: typeof payload?.model === "string" ? payload.model : undefined,
+      thoughts,
     };
   }
 
   const decoder = new TextDecoder();
   let buffer = "";
   let fullText = "";
+  let fullThoughts = "";
   let usage: any = null;
   let model: string | undefined;
 
@@ -600,9 +951,18 @@ async function readOpenAICompatibleStream(
         const payload = JSON.parse(data);
         if (typeof payload?.model === "string") model = payload.model;
         if (payload?.usage) usage = pickBetterUsage(usage, payload.usage);
-        const delta = payload?.choices?.[0]?.delta;
-        const content = delta?.content ?? delta?.text ?? "";
-        if (typeof content === "string" && content) {
+        const choice = payload?.choices?.[0] || {};
+        const reasoningText = compactReasoningChunks([
+          extractReasoningText(choice?.delta),
+          extractReasoningText(choice),
+          extractReasoningText(payload),
+        ]);
+        if (reasoningText) {
+          fullThoughts = mergeReasoningText(fullThoughts, reasoningText);
+          onMetaUpdate?.({ thoughts: fullThoughts });
+        }
+        const content = extractStreamTextDelta(payload);
+        if (content) {
           fullText += content;
           onStreamUpdate?.(fullText);
         }
@@ -613,7 +973,7 @@ async function readOpenAICompatibleStream(
     }
   }
 
-  return { text: fullText.trim(), usage, model };
+  return { text: fullText.trim(), usage, model, thoughts: fullThoughts };
 }
 
 async function completeWithOpenAICompatible(
@@ -628,14 +988,67 @@ async function completeWithOpenAICompatible(
   const endpoint = `${trimTrailingSlash(profile.baseUrl)}/chat/completions`;
   const cacheProvider = resolvePromptCacheProvider(provider, profile);
   const promptCacheParts = buildClaudePromptCachePlan(request, promptPreview, profile.model);
-  let useClaudePromptCache = provider === "openrouter" && isClaudeLikeProfile(provider, profile) && !!promptCacheParts;
-  const promptCacheMeta = useClaudePromptCache && promptCacheParts
-    ? {
-        cacheStrategy: promptCacheParts.cacheStrategy,
-        cacheablePrefixTokens: promptCacheParts.cacheablePrefixTokens,
-        cacheablePrefixMinTokens: promptCacheParts.cacheablePrefixMinTokens,
-      }
-    : undefined;
+  const isClaudeLike = isClaudeLikeProfile(provider, profile);
+  const autoStablePrefixParts = !isClaudeLike ? splitPromptForClaudeCache(request, promptPreview) : null;
+  const claudeCacheTtl = resolveClaudeCacheTtl(settings, request);
+  const openRouterSessionId = provider === "openrouter"
+    ? String(request.cacheScope || "").trim().slice(0, 256)
+    : "";
+  let useClaudePromptCache = provider === "openrouter" && isClaudeLike && !!promptCacheParts;
+  let useAutoStableSystemPrefix = !useClaudePromptCache && !!autoStablePrefixParts;
+  let promptCacheSkipReason = useClaudePromptCache
+    ? ""
+    : isClaudeLike
+      ? provider !== "openrouter"
+        ? "not_openrouter"
+        : !promptCacheParts
+          ? "no_stable_prefix"
+          : "cache_control_not_enabled"
+      : "provider_auto_cache";
+  const getPromptCacheMeta = () => ({
+    providerCacheMode: isClaudeLikeProfile(provider, profile)
+      ? useClaudePromptCache
+        ? "anthropic_explicit"
+        : "anthropic_compatible_no_cache"
+      : cacheProvider === "openai"
+        ? "openai_auto"
+        : "provider_auto_or_unknown",
+    cacheControlUsed: useClaudePromptCache,
+    cacheControlTtl: useClaudePromptCache ? formatClaudeCacheTtlForDebug(claudeCacheTtl) : undefined,
+    cacheControlSkipReason: useClaudePromptCache ? undefined : useAutoStableSystemPrefix ? "auto_cache_no_control" : promptCacheSkipReason,
+    cacheStrategy: useClaudePromptCache
+      ? promptCacheParts?.cacheStrategy
+      : useAutoStableSystemPrefix
+        ? `${cacheProvider}-stable-system-prefix`
+        : undefined,
+    cacheablePrefixTokens: useClaudePromptCache
+      ? promptCacheParts?.cacheablePrefixTokens
+      : useAutoStableSystemPrefix
+        ? estimateTokens(autoStablePrefixParts?.stablePrefix || "")
+        : undefined,
+    cacheablePrefixMinTokens: useClaudePromptCache
+      ? promptCacheParts?.cacheablePrefixMinTokens
+      : useAutoStableSystemPrefix
+        ? 1024
+        : undefined,
+    cacheBreakpointBlock: useClaudePromptCache
+      ? promptCacheParts?.stableContext
+        ? "stable_context_user_text_block"
+        : "stable_user_text_block"
+      : useAutoStableSystemPrefix
+        ? "stable_system_message"
+        : undefined,
+    requestChannel: request.channel || "chat",
+    cacheScope: request.cacheScope,
+  });
+  const isKnownNonReasoningOpenAIModel = /(?:^|\/)gpt-(?:4o|4\.1|4\.5|4-turbo)(?:[-/:]|$)/i.test(profile.model);
+  const reasoningEnabled =
+    !!settings.enableReasoning &&
+    (request.channel || "chat") === "chat" &&
+    request.mode !== "plan" &&
+    !!request.onMetaUpdate &&
+    !isKnownNonReasoningOpenAIModel;
+  let useReasoningExtras = reasoningEnabled;
   // Plan generation needs one complete JSON document. It gains nothing from
   // streaming partial tokens, and several compatible providers can split or
   // interleave structured output in ways that leave an incomplete JSON payload.
@@ -659,14 +1072,27 @@ async function completeWithOpenAICompatible(
   const hasImageInput = imageParts.length > 0;
   let includeImages = true;
 
-  const buildContent = (): any => {
+  const buildUserContent = (text: string): any => {
+    const textPart = { type: "text", text };
+    const parts = includeImages ? [textPart, ...imageParts] : [textPart];
+    return parts.length > 1 ? parts : text;
+  };
+
+  const buildClaudeCachedContent = (): any => {
     const textParts: any[] = useClaudePromptCache && promptCacheParts
       ? [
           {
             type: "text",
             text: promptCacheParts.stablePrefix,
-            cache_control: CLAUDE_CACHE_CONTROL,
+            cache_control: getClaudeCacheControl(claudeCacheTtl),
           },
+          ...(promptCacheParts.stableContext
+            ? [{
+                type: "text",
+                text: promptCacheParts.stableContext,
+                cache_control: getClaudeCacheControl(claudeCacheTtl),
+              }]
+            : []),
           { type: "text", text: promptCacheParts.dynamicTail },
         ]
       : [{ type: "text", text: promptPreview }];
@@ -674,10 +1100,24 @@ async function completeWithOpenAICompatible(
     return parts.length > 1 ? parts : promptPreview;
   };
 
+  const buildMessages = (): any[] => {
+    if (useClaudePromptCache) {
+      return [{ role: "user", content: buildClaudeCachedContent() }];
+    }
+    if (useAutoStableSystemPrefix && autoStablePrefixParts) {
+      return [
+        { role: "system", content: autoStablePrefixParts.stablePrefix },
+        { role: "user", content: buildUserContent(autoStablePrefixParts.dynamicTail) },
+      ];
+    }
+    return [{ role: "user", content: buildUserContent(promptPreview) }];
+  };
+
   const buildBody = (): Record<string, unknown> => {
     const body: Record<string, unknown> = {
       model: profile.model,
-      messages: [{ role: "user", content: buildContent() }],
+      messages: buildMessages(),
+      ...(openRouterSessionId ? { session_id: openRouterSessionId } : {}),
       temperature,
       max_tokens: maxOutputTokens,
       stream: shouldStream,
@@ -687,9 +1127,12 @@ async function completeWithOpenAICompatible(
       body.stream_options = { include_usage: true };
     }
 
-    // A visible thinking trace is useful in conversation, not in a strict JSON
-    // planning call; for plans it can consume output budget or pollute the body.
-    if (provider === "glm" && request.mode !== "plan") {
+    if (provider === "openrouter" && useReasoningExtras) {
+      body.include_reasoning = true;
+      body.reasoning = { effort: "medium" };
+    }
+
+    if (provider === "glm" && useReasoningExtras) {
       body.thinking = { type: "enabled" };
     }
 
@@ -699,6 +1142,7 @@ async function completeWithOpenAICompatible(
   const headers = {
     Authorization: `Bearer ${profile.apiKey}`,
     "Content-Type": "application/json",
+    ...openRouterAppHeadersForBase(profile.baseUrl),
   };
 
   let requestBody = buildBody();
@@ -713,6 +1157,19 @@ async function completeWithOpenAICompatible(
     let text = await response.text();
     if (useClaudePromptCache && shouldRetryWithoutPromptCache(text)) {
       useClaudePromptCache = false;
+      useAutoStableSystemPrefix = false;
+      promptCacheSkipReason = "retry_without_cache_control";
+      requestBody = buildBody();
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+        signal: request.signal,
+      });
+      text = response.ok ? "" : await response.text();
+    }
+    if (!response.ok && useReasoningExtras && shouldRetryWithoutReasoning(text)) {
+      useReasoningExtras = false;
       requestBody = buildBody();
       response = await fetch(endpoint, {
         method: "POST",
@@ -736,11 +1193,17 @@ async function completeWithOpenAICompatible(
     }
     if (!response.ok && hasImageInput && shouldRetryWithoutImages(text)) {
       includeImages = false;
+      const fallbackText = "[Vision fallback]\nThe configured model or endpoint rejected image inputs. Continue with the text, image names, and attachment notes only. If the user asks you to inspect the image itself, say naturally that this model cannot read the image and suggest switching to a vision-capable model.";
       const fallbackBody = buildBody();
-      fallbackBody.messages = [{
-        role: "user",
-        content: `${promptPreview}\n\n[Vision fallback]\nThe configured model or endpoint rejected image inputs. Continue with the text, image names, and attachment notes only. If the user asks you to inspect the image itself, say naturally that this model cannot read the image and suggest switching to a vision-capable model.`,
-      }];
+      fallbackBody.messages = useAutoStableSystemPrefix && autoStablePrefixParts
+        ? [
+            { role: "system", content: autoStablePrefixParts.stablePrefix },
+            { role: "user", content: `${autoStablePrefixParts.dynamicTail}\n\n${fallbackText}` },
+          ]
+        : [{
+            role: "user",
+            content: `${promptPreview}\n\n${fallbackText}`,
+          }];
       requestBody = fallbackBody;
       response = await fetch(endpoint, {
         method: "POST",
@@ -762,17 +1225,43 @@ async function completeWithOpenAICompatible(
     }
   }
 
+  const translateThoughtsIfNeeded = async (rawThoughts: string): Promise<string | undefined> => {
+    const source = rawThoughts.trim();
+    if (!source || !settings.reasoningPreferChinese) return undefined;
+    request.onMetaUpdate?.({ thoughtsTranslated: REASONING_TRANSLATION_PENDING_TEXT });
+    try {
+      const translated = await withTimeout(
+        translateReasoningToChinese(settings, source, request.signal),
+        REASONING_TRANSLATION_TIMEOUT_MS,
+      );
+      const finalText = translated.trim() || source;
+      request.onMetaUpdate?.({ thoughtsTranslated: finalText });
+      return finalText;
+    } catch {
+      request.onMetaUpdate?.({ thoughtsTranslated: REASONING_TRANSLATION_TIMEOUT_TEXT });
+      return REASONING_TRANSLATION_TIMEOUT_TEXT;
+    }
+  };
+
   if (shouldStream) {
-    const streamed = await readOpenAICompatibleStream(response, request.onStreamUpdate);
+    const streamed = await readOpenAICompatibleStream(
+      response,
+      request.onStreamUpdate,
+      useReasoningExtras ? request.onMetaUpdate : undefined,
+    );
     const parsedUsage = parseUsageForPromptCache(streamed.usage);
     if (streamed.usage) {
-      recordPromptCacheTurn(cacheProvider, streamed.model || profile.model, streamed.usage, promptCacheMeta);
+      recordPromptCacheTurn(cacheProvider, streamed.model || profile.model, streamed.usage, getPromptCacheMeta());
     }
+    const thoughts = useReasoningExtras ? (streamed.thoughts || "").trim() : "";
+    const thoughtsTranslated = thoughts ? await translateThoughtsIfNeeded(thoughts) : undefined;
     return {
       text: streamed.text || "模型返回为空。",
       promptPreview,
       modelUsed: streamed.model || profile.model,
       tokenCount: parsedUsage?.outputTokens || estimateTokens(streamed.text),
+      thoughts: thoughts || undefined,
+      thoughtsTranslated,
     };
   }
 
@@ -790,15 +1279,28 @@ async function completeWithOpenAICompatible(
       cacheProvider,
       typeof payload?.model === "string" ? payload.model : profile.model,
       payload.usage,
-      promptCacheMeta,
+      getPromptCacheMeta(),
     );
   }
+
+  const message = payload?.choices?.[0]?.message;
+  const thoughts = useReasoningExtras
+    ? compactReasoningChunks([
+        extractReasoningText(message),
+        extractReasoningText(payload?.choices?.[0]),
+        extractReasoningText(payload),
+      ])
+    : "";
+  if (thoughts) request.onMetaUpdate?.({ thoughts });
+  const thoughtsTranslated = thoughts ? await translateThoughtsIfNeeded(thoughts) : undefined;
 
   return {
     text: extractTextFromOpenAICompatible(payload) || "模型返回为空。",
     promptPreview,
     modelUsed: typeof payload?.model === "string" ? payload.model : profile.model,
     tokenCount: parsedUsage?.outputTokens || estimateTokens(extractTextFromOpenAICompatible(payload)),
+    thoughts: thoughts || undefined,
+    thoughtsTranslated,
   };
 }
 
@@ -811,14 +1313,25 @@ async function completeWithClaude(
   const temperature = settings.temperature;
   const maxOutputTokens = getMaxOutputTokens(settings, request);
   const promptCacheParts = buildClaudePromptCachePlan(request, promptPreview, profile.model);
+  const claudeCacheTtl = resolveClaudeCacheTtl(settings, request);
   let useClaudePromptCache = !!promptCacheParts;
-  const promptCacheMeta = useClaudePromptCache && promptCacheParts
-    ? {
-        cacheStrategy: promptCacheParts.cacheStrategy,
-        cacheablePrefixTokens: promptCacheParts.cacheablePrefixTokens,
-        cacheablePrefixMinTokens: promptCacheParts.cacheablePrefixMinTokens,
-      }
-    : undefined;
+  let promptCacheSkipReason = useClaudePromptCache ? "" : "no_stable_prefix";
+  const getPromptCacheMeta = () => ({
+    providerCacheMode: useClaudePromptCache ? "anthropic_explicit" : "anthropic_compatible_no_cache",
+    cacheControlUsed: useClaudePromptCache,
+    cacheControlTtl: useClaudePromptCache ? formatClaudeCacheTtlForDebug(claudeCacheTtl) : undefined,
+    cacheControlSkipReason: useClaudePromptCache ? undefined : promptCacheSkipReason,
+    cacheStrategy: useClaudePromptCache ? promptCacheParts?.cacheStrategy : undefined,
+    cacheablePrefixTokens: useClaudePromptCache ? promptCacheParts?.cacheablePrefixTokens : undefined,
+    cacheablePrefixMinTokens: useClaudePromptCache ? promptCacheParts?.cacheablePrefixMinTokens : undefined,
+    cacheBreakpointBlock: useClaudePromptCache
+      ? promptCacheParts?.stableContext
+        ? "stable_context_system_message"
+        : "stable_system_message"
+      : undefined,
+    requestChannel: request.channel || "chat",
+    cacheScope: request.cacheScope,
+  });
   const content: any[] = [{ type: "text", text: promptCacheParts?.dynamicTail || promptPreview }];
   const image = settings.contextLoad.attachScreenshot ? getDataUrlParts(request.watch.screenshotDataUrl) : null;
   const attachedImages = imagesForModel(request, 4)
@@ -859,11 +1372,20 @@ async function completeWithClaude(
       temperature,
       ...(useClaudePromptCache && promptCacheParts
         ? {
-            system: [{
-              type: "text",
-              text: promptCacheParts.stablePrefix,
-              cache_control: CLAUDE_CACHE_CONTROL,
-            }],
+            system: [
+              {
+                type: "text",
+                text: promptCacheParts.stablePrefix,
+                cache_control: getClaudeCacheControl(claudeCacheTtl),
+              },
+              ...(promptCacheParts.stableContext
+                ? [{
+                    type: "text",
+                    text: promptCacheParts.stableContext,
+                    cache_control: getClaudeCacheControl(claudeCacheTtl),
+                  }]
+                : []),
+            ],
           }
         : {}),
       messages: [{ role: "user", content }],
@@ -879,6 +1401,7 @@ async function completeWithClaude(
 
   if (!rawResponse.ok && useClaudePromptCache && shouldRetryWithoutPromptCache(rawText)) {
     useClaudePromptCache = false;
+    promptCacheSkipReason = "retry_without_cache_control";
     content[0] = { type: "text", text: promptPreview };
     rawResponse = await fetch(endpoint, {
       method: "POST",
@@ -902,7 +1425,28 @@ async function completeWithClaude(
 
   const parsedUsage = parseUsageForPromptCache(payload?.usage);
   if (payload?.usage) {
-    recordPromptCacheTurn("claude", typeof payload?.model === "string" ? payload.model : profile.model, payload.usage, promptCacheMeta);
+    recordPromptCacheTurn("claude", typeof payload?.model === "string" ? payload.model : profile.model, payload.usage, getPromptCacheMeta());
+  }
+
+  const contentParts = Array.isArray(payload?.content) ? payload.content : [];
+  const thoughts = settings.enableReasoning
+    ? compactReasoningChunks(contentParts.map((part: any) => extractReasoningText(part)))
+    : "";
+  if (thoughts) request.onMetaUpdate?.({ thoughts });
+  let thoughtsTranslated: string | undefined;
+  if (thoughts && settings.reasoningPreferChinese) {
+    request.onMetaUpdate?.({ thoughtsTranslated: REASONING_TRANSLATION_PENDING_TEXT });
+    try {
+      const translated = await withTimeout(
+        translateReasoningToChinese(settings, thoughts, request.signal),
+        REASONING_TRANSLATION_TIMEOUT_MS,
+      );
+      thoughtsTranslated = translated.trim() || thoughts;
+      request.onMetaUpdate?.({ thoughtsTranslated });
+    } catch {
+      thoughtsTranslated = REASONING_TRANSLATION_TIMEOUT_TEXT;
+      request.onMetaUpdate?.({ thoughtsTranslated });
+    }
   }
 
   return {
@@ -912,6 +1456,8 @@ async function completeWithClaude(
     promptPreview,
     modelUsed: typeof payload?.model === "string" ? payload.model : profile.model,
     tokenCount: parsedUsage?.outputTokens || undefined,
+    thoughts: thoughts || undefined,
+    thoughtsTranslated,
   };
 }
 
@@ -968,7 +1514,10 @@ async function completeWithGemini(
 
   const parsedUsage = parseUsageForPromptCache(payload?.usageMetadata);
   if (payload?.usageMetadata) {
-    recordPromptCacheTurn("gemini", profile.model, payload.usageMetadata);
+    recordPromptCacheTurn("gemini", profile.model, payload.usageMetadata, {
+      requestChannel: request.channel || "chat",
+      cacheScope: request.cacheScope,
+    });
   }
 
   return {

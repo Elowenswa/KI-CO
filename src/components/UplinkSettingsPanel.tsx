@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Brain, Calendar, Check, ChevronDown, Clock, Cpu, Database, Download, Eye, FileJson, Hash, HelpCircle, Image, Loader2, Palette, Upload, User, Wifi, Zap } from "lucide-react";
+import { Brain, Calendar, Check, ChevronDown, Clock, Cpu, Database, Download, Eye, FileJson, Hash, HelpCircle, Image, Loader2, Luggage, Palette, Smile, Upload, User, Wifi, Zap } from "lucide-react";
 import type {
   ContextLoadSettings,
+  EmojiFrequency,
   FontSizePreset,
   FontStylePreset,
   JournalProvider,
@@ -12,7 +13,7 @@ import type {
   VisualAtmosphereSettings,
 } from "../types";
 import { JOURNAL_MODEL_PRESETS, MODEL_PRESETS, PROVIDER_HINTS, PROVIDER_LABELS } from "../settings/uplinkSettings";
-import { createFullBackup, createSettingsBackup, downloadBackup, importBackup, inspectBackupConversations } from "../storage/fullBackup";
+import { createFullBackup, createSettingsBackup, createTravelPack, downloadBackup, importBackup, inspectBackupConversations } from "../storage/fullBackup";
 import type { PersonaProfile } from "../storage/personaProfile";
 import { getChroniclePreferences, saveChroniclePreferences, subscribeChronicles } from "../storage/chronicles";
 
@@ -43,7 +44,7 @@ const THEME_PREVIEWS: Record<ThemePreset, string> = {
   "black-gold": "#050505",
   "white-gold": "#f8fafb",
   "pink-mocha": "linear-gradient(135deg, #42382e, #b58c8c)",
-  custom: "linear-gradient(135deg, #efe9f2 0%, #d9cfe5 42%, #9f735c 100%)",
+  custom: "linear-gradient(135deg, #efe9f2 0%, #d9cfe5 42%, #a28576 100%)",
 };
 
 const FONT_STYLE_LABELS: Record<FontStylePreset, string> = {
@@ -70,6 +71,75 @@ const BACKGROUND_FIT_HINTS: Record<VisualAtmosphereSettings["backgroundFit"], st
   contain: "完整：尽量显示整张背景，不裁切。点击切换为铺满。",
   cover: "铺满：填满观影室背景，会裁切边缘。点击切换为舞台。",
 };
+
+const CLAUDE_CACHE_TTL_OPTIONS: Array<{
+  value: UplinkSettings["claudeCacheTtlMode"];
+  label: string;
+  hint: string;
+}> = [
+  { value: "auto", label: "自动", hint: "主对话根据 Time Bridge 的间隔判断，辅助通道仍用 5 分钟。" },
+  { value: "5m", label: "5分钟", hint: "适合集中连续聊天，命中会自动续期。" },
+  { value: "1h", label: "1小时", hint: "适合聊一会儿、忙一会儿再回来。" },
+];
+
+const REASONING_HELP_COPY = {
+  enable: {
+    title: "启用思考链",
+    short: "向支持的模型请求 reasoning/thoughts，并在回复上方显示 thinking。",
+    body: "开启后，小屋会在主对话请求里向支持的模型/中转站请求 reasoning 或 thoughts，并把拿到的内容折叠显示在回复上方。返回语言由模型和通道决定，小屋不强制改写思考链语言。",
+  },
+  translate: {
+    title: "思考链翻译",
+    short: "用日记模型把 thinking 转成中文显示，会额外消耗轻量模型 token。",
+    body: "适合 thinking 是英文或中英混合时使用。开启后会调用日记/总结通道把本轮 thinking 转成中文显示，原文仍会保留，因此会额外消耗一次轻量模型调用。",
+  },
+  unsupported: {
+    title: "当前模型不返回思考链",
+    short: "这个主对话模型通常不会返回 reasoning/thoughts。",
+    body: "当前主对话模型通常不会返回可展示的 thinking。小屋已保持思考链关闭，避免用户误以为开关坏了，也避免发送无效 reasoning 参数。",
+  },
+} as const;
+
+function SettingsStarGlyph({ size = 12 }: { size?: number }) {
+  return (
+    <svg className="settings-standard-star" width={size} height={size} viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <line x1="2.5" y1="7" x2="11.5" y2="7" stroke="var(--interactive-accent, currentColor)" strokeWidth="0.65" opacity="0.6" />
+      <line x1="7" y1="0.5" x2="7" y2="13.5" stroke="var(--interactive-accent, currentColor)" strokeWidth="0.65" opacity="0.6" />
+      <path
+        d="M7 0.8 C7 4.2 9.0 6.5 10.8 7 C9.0 7.5 7 9.8 7 13.2 C7 9.8 5.0 7.5 3.2 7 C5.0 6.5 7 4.2 7 0.8 Z"
+        fill="var(--interactive-accent, currentColor)"
+      />
+    </svg>
+  );
+}
+
+function JournalChannelGlyph() {
+  return (
+    <svg className="journal-channel-glyph" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 14 14" width="28" height="28" fill="none" aria-hidden="true">
+      <path d="M7 11.5 C5.5 9.5 2.5 9.5 2.5 9.5 L2.5 3 C2.5 3 5.5 3 7 5.5" fill="none" stroke="var(--interactive-accent, #dcbda8)" strokeWidth="0.85" />
+      <path d="M7 11.5 C8.5 9.5 11.5 9.5 11.5 9.5 L11.5 3 C11.5 3 8.5 3 7 5.5" fill="none" stroke="var(--interactive-accent, #dcbda8)" strokeWidth="0.85" />
+      <ellipse cx="7" cy="5" rx="4.5" ry="1.8" fill="none" stroke="var(--text-accent, #a694bc)" strokeWidth="0.5" opacity="0.6" transform="rotate(-15, 7, 5)" />
+      <line x1="7" y1="3" x2="7" y2="11.5" stroke="var(--interactive-accent, #dcbda8)" strokeWidth="0.6" />
+    </svg>
+  );
+}
+
+const EMOJI_FREQUENCY_OPTIONS: Array<{ id: EmojiFrequency; label: string; hint: string }> = [
+  { id: "off", label: "默认", hint: "不注入任何 emoji 频率要求，完全使用模型原生风格。" },
+  { id: "low", label: "少", hint: "轻量使用，通常 0-1 个/条。" },
+  { id: "medium", label: "中", hint: "中等使用，通常 1-3 个/条。" },
+  { id: "high", label: "多", hint: "较高使用，通常 2-5 个/条，避免刷屏。" },
+];
+
+function isClaudeLikeMainModel(provider: UplinkSettings["activeProvider"], model?: string, baseUrl?: string): boolean {
+  const source = `${provider || ""} ${model || ""} ${baseUrl || ""}`.toLowerCase();
+  return /\b(anthropic|claude|sonnet|opus|haiku)\b/.test(source);
+}
+
+function isKnownNonReasoningMainModel(provider: UplinkSettings["activeProvider"], model?: string, baseUrl?: string): boolean {
+  const source = `${provider || ""} ${model || ""} ${baseUrl || ""}`;
+  return /(?:^|[\/\s:_-])gpt-(?:4o|4\.1|4\.5|4-turbo)(?:[-/:_\s]|$)/i.test(source);
+}
 
 const HUD_TOGGLES: Array<{
   key: keyof Pick<
@@ -146,6 +216,8 @@ function SettingsSection({ icon, title, subtitle, open, onToggle, children }: Se
 export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPersonaChange }: UplinkSettingsPanelProps) {
   const provider = settings.activeProvider;
   const profile = settings.profiles[provider];
+  const showClaudeCacheTtlPanel = isClaudeLikeMainModel(provider, profile.model, profile.baseUrl);
+  const reasoningUnsupported = isKnownNonReasoningMainModel(provider, profile.model, profile.baseUrl);
   const presets = MODEL_PRESETS[provider];
   const journalProviderSetting: JournalProvider = settings.journalProvider || "openrouter";
   const journalProvider: ModelProvider = journalProviderSetting === "active" ? provider : journalProviderSetting;
@@ -167,6 +239,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
   });
   const [maxOutputTokensDraft, setMaxOutputTokensDraft] = useState(String(settings.contextLoad.maxOutputTokens));
   const [chroniclePreferences, setChroniclePreferences] = useState(() => getChroniclePreferences());
+  const [reasoningHelp, setReasoningHelp] = useState<keyof typeof REASONING_HELP_COPY | null>(null);
 
   useEffect(() => {
     setMaxOutputTokensDraft(String(settings.contextLoad.maxOutputTokens));
@@ -264,10 +337,10 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
     return new Date().toISOString().slice(0, 10);
   }
 
-  function handleFullBackup() {
+  async function handleFullBackup() {
     downloadBackup(
       `KISERA_COTTAGE_FULL_BACKUP_${backupDateLabel()}.json`,
-      createFullBackup(settings, personaProfile),
+      await createFullBackup(settings, personaProfile),
     );
   }
 
@@ -275,6 +348,13 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
     downloadBackup(
       `kisera_cottage_settings_${backupDateLabel()}.json`,
       createSettingsBackup(settings, personaProfile),
+    );
+  }
+
+  function handleTravelPack() {
+    downloadBackup(
+      `KISERA_COTTAGE_TRAVEL_PACK_${backupDateLabel()}.json`,
+      createTravelPack(settings, personaProfile),
     );
   }
 
@@ -292,7 +372,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
         );
         conflictMode = merge ? "merge" : "copy";
       }
-      const result = importBackup(text, settings, conflictMode);
+      const result = await importBackup(text, settings, conflictMode);
       onChange(result.settings);
       onPersonaChange(result.personaProfile);
       window.dispatchEvent(new Event("kisera-cottage-data-imported"));
@@ -419,6 +499,44 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
               </div>
             </div>
 
+            <div className="reply-aesthetics-card">
+              <div className="reply-aesthetics-head">
+                <div className="visual-block-title visual-compact-title">
+                  <Smile size={14} />
+                  <span>回复美学</span>
+                </div>
+              </div>
+              <div className="reply-aesthetics-copy">
+                <span className="reply-aesthetics-title-line">
+                  <strong>Markdown 风格</strong>
+                  <button
+                    type="button"
+                    className={`mini-toggle ${settings.visual.markdownNarrativeEnabled ? "active" : ""}`}
+                    onClick={() => updateVisual({ markdownNarrativeEnabled: !settings.visual.markdownNarrativeEnabled })}
+                    aria-pressed={settings.visual.markdownNarrativeEnabled}
+                    title={settings.visual.markdownNarrativeEnabled ? "Current Mode: Enhanced Narrative" : "Current Mode: Clean Text"}
+                  >
+                    <span />
+                  </button>
+                </span>
+                <small>开启后会使用分层 Markdown 叙事（动作/重音/独白/转场）。</small>
+              </div>
+              <div className="reply-emoji-row" aria-label="Emoji 频率">
+                <span>Emoji</span>
+                {EMOJI_FREQUENCY_OPTIONS.map((option) => (
+                  <button
+                    type="button"
+                    key={option.id}
+                    className={settings.visual.emojiFrequency === option.id ? "active" : ""}
+                    onClick={() => updateVisual({ emojiFrequency: option.id })}
+                    title={option.hint}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <div className="hud-toggle-card">
               <div className="visual-block-title visual-compact-title">
                 <Eye size={14} />
@@ -500,12 +618,88 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
             </label>
           </div>
 
+          {showClaudeCacheTtlPanel && (
+          <div className="claude-cache-card">
+            <div className="claude-cache-head">
+              <Clock size={14} />
+              <div>
+                <strong>Claude 主对话缓存时长</strong>
+                <small>仅 Claude / Anthropic 兼容主对话生效；非 Claude 模型会自动忽略。</small>
+              </div>
+            </div>
+            <div className="claude-cache-options">
+              {CLAUDE_CACHE_TTL_OPTIONS.map((option) => (
+                <button
+                  type="button"
+                  key={option.value}
+                  className={settings.claudeCacheTtlMode === option.value ? "active" : ""}
+                  onClick={() => updateSettings({ claudeCacheTtlMode: option.value })}
+                  title={option.hint}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <p>自动模式会优先照顾情感长聊的“离开一会儿再回来”；日记、状态卡等辅助调用固定走 5 分钟。</p>
+          </div>
+          )}
+
+          <div className="reasoning-settings-card">
+            <button
+              type="button"
+              className={`reasoning-toggle-row ${settings.enableReasoning ? "active" : ""} ${reasoningUnsupported ? "disabled" : ""}`}
+              data-hint={reasoningUnsupported ? REASONING_HELP_COPY.unsupported.short : REASONING_HELP_COPY.enable.short}
+              onClick={() => {
+                if (!settings.enableReasoning && reasoningUnsupported) {
+                  setReasoningHelp("unsupported");
+                  updateSettings({ enableReasoning: false, reasoningPreferChinese: false });
+                  return;
+                }
+                setReasoningHelp("enable");
+                updateSettings({
+                  enableReasoning: !settings.enableReasoning,
+                  reasoningPreferChinese: settings.enableReasoning ? false : settings.reasoningPreferChinese,
+                });
+              }}
+            >
+              <span className="reasoning-toggle-dot">{settings.enableReasoning ? <Check size={12} /> : null}</span>
+              <span>
+                <strong>启用思考链</strong>
+                <small>仅开启后才会请求 reasoning/thoughts 并展示思考链。</small>
+              </span>
+            </button>
+            <button
+              type="button"
+              className={`reasoning-toggle-row ${settings.reasoningPreferChinese ? "active" : ""} ${settings.enableReasoning ? "" : "disabled"}`}
+              aria-disabled={!settings.enableReasoning}
+              data-hint={REASONING_HELP_COPY.translate.short}
+              onClick={() => {
+                setReasoningHelp("translate");
+                if (!settings.enableReasoning) return;
+                updateSettings({ reasoningPreferChinese: !settings.reasoningPreferChinese });
+              }}
+            >
+              <span className="reasoning-toggle-dot">{settings.reasoningPreferChinese ? <Check size={12} /> : null}</span>
+              <span>
+                <strong>思考链翻译</strong>
+                <small>开启后使用日记模型生成中文（显示“翻译中...”需等待）。</small>
+              </span>
+            </button>
+          </div>
+          {reasoningHelp ? (
+            <div className="reasoning-help-popover">
+              <button type="button" onClick={() => setReasoningHelp(null)} aria-label="关闭思考链说明">×</button>
+              <strong>{REASONING_HELP_COPY[reasoningHelp].title}</strong>
+              <p>{REASONING_HELP_COPY[reasoningHelp].body}</p>
+            </div>
+          ) : null}
+
           <div className="journal-channel-card">
             <div className="journal-channel-head">
-              <span className="journal-channel-icon"><FileJson size={15} /></span>
+              <span className="journal-channel-icon"><JournalChannelGlyph /></span>
               <div>
                 <strong>日记/总结通道</strong>
-                <small>日记/总结模型可调用轻量模型，不影响主对话。</small>
+                <small>可调用轻量模型，不影响主对话</small>
               </div>
             </div>
 
@@ -573,21 +767,17 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
 
         <SettingsSection
           icon={<Calendar size={18} />}
-          title="时空锚点 (Chronos)"
-          subtitle="日期、星期、节日和当前时段；只放进动态上下文。"
+          title="时间桥 (Time Bridge)"
+          subtitle="控制动态段里的时间感知：让Ta知道当前时间、隔了多久、上次长对话锚点、生活线/召回的日记是哪天"
           open={openSections.chronos}
           onToggle={() => toggleSection("chronos")}
         >
           <div className="chronos-settings-card">
-            <div className="chronos-copy">
-              <strong>时间感知 (Time Awareness)</strong>
-              <small>影响模型是否知道“今天是什么日子 / 现在是不是深夜”。实时感知更有生活感，但不会放进稳定缓存前缀。</small>
-            </div>
             <div className="chronos-mode-row">
               {([
-                ["off", "关闭", "不注入日期或时间。"],
-                ["date_only", "日期感知", "日期 / 星期 / 节日 / 时段。"],
-                ["realtime", "实时感知", "在日期感知基础上加入当前时间。"],
+                ["off", "关闭", "不注入时间桥。"],
+                ["date_only", "轻量", "日期 / 星期 / 节日 / 时段 / 间隔。"],
+                ["realtime", "实时", "在轻量时间桥基础上加入当前分钟级时间。"],
               ] as const).map(([value, label, hint]) => (
                 <button
                   key={value}
@@ -596,12 +786,12 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                   onClick={() => updateContextLoad({ timeAwarenessMode: value })}
                   title={hint}
                 >
-                  {settings.contextLoad.timeAwarenessMode === value ? <span aria-hidden="true">✦</span> : null}
+                  {settings.contextLoad.timeAwarenessMode === value ? <SettingsStarGlyph /> : null}
                   {label}
                 </button>
               ))}
             </div>
-            <p>建议日常默认使用“日期感知”。只有希望 TA 知道具体几点、比如凌晨陪聊或熬夜工作时，再开“实时感知”。</p>
+            <p>建议日常默认使用“轻量”。旅行、隔夜回来、深夜陪聊时，可开“实时”。</p>
           </div>
         </SettingsSection>
 
@@ -655,7 +845,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                   ["vector", "向量", "主要使用 embedding 语义相似度。"],
                 ] as const).map(([value, label, description]) => (
                   <button key={value} type="button" className={settings.memoryRetrieval.memoryRetrievalMode === value ? "active" : ""} onClick={() => updateMemoryRetrieval({ memoryRetrievalMode: value })} title={description}>
-                    {settings.memoryRetrieval.memoryRetrievalMode === value ? <span aria-hidden="true">✦</span> : null}{label}
+                    {settings.memoryRetrieval.memoryRetrievalMode === value ? <SettingsStarGlyph /> : null}{label}
                   </button>
                 ))}
               </div>
@@ -688,6 +878,14 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                 </span>
               </button>
 
+              <button type="button" className="backup-action" onClick={handleTravelPack} title="可用于外出时导入云端小屋，含人格核/记忆库/3个窗口/7天日记/状态卡/生活线">
+                <span className="backup-action-icon"><Luggage size={18} /></span>
+                <span className="backup-action-copy">
+                  <strong>导出小旅行包</strong>
+                  <small>可用于外出时导入云端小屋，含人格核/记忆库/3个窗口/7天日记/状态卡/生活线</small>
+                </span>
+              </button>
+
               <button type="button" className="backup-action" onClick={handleSettingsBackup}>
                 <span className="backup-action-icon"><FileJson size={18} /></span>
                 <span className="backup-action-copy">
@@ -698,7 +896,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
 
               <button
                 type="button"
-                className={`backup-action ${isImporting ? "busy" : ""}`}
+                className={`backup-action backup-action-import ${isImporting ? "busy" : ""}`}
                 disabled={isImporting}
                 onClick={() => importInputRef.current?.click()}
               >
@@ -707,7 +905,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                 </span>
                 <span className="backup-action-copy">
                   <strong>{isImporting ? "正在恢复数据..." : "恢复/导入数据"}</strong>
-                  <small>支持完整备份或纯配置文件</small>
+                  <small>支持完整备份、小旅行包或纯配置文件</small>
                 </span>
                 <input
                   ref={importInputRef}

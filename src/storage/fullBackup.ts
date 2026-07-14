@@ -2,8 +2,11 @@ import type { ConversationRecord, ModelProvider, UplinkSettings, WatchRecord } f
 import { normalizeUplinkSettings } from "../settings/uplinkSettings";
 import {
   exportConversationRecords,
+  hydrateConversationRecords,
   importConversationRecords,
+  importConversationRecordsAsync,
   inspectConversationImport,
+  normalizeConversationRecord as normalizeConversationRecordForStorage,
   type ConversationImportConflictMode,
   type ConversationImportInspection,
 } from "./conversations";
@@ -39,7 +42,22 @@ import {
 
 const FULL_SCHEMA = "kisera_cottage_full_backup_v1";
 const SETTINGS_SCHEMA = "kisera_cottage_settings_backup_v1";
+const TRAVEL_PACK_SCHEMA = "kisera_cottage_travel_pack_v1";
 const LEGACY_APP_NAME_HINT = /sanctuary/i;
+const FULL_BACKUP_STATUS_KEY = "kisera_cottage_full_backup_status_v1";
+const FULL_BACKUP_REMINDER_INTERVAL_MS = 5 * 24 * 60 * 60 * 1000;
+const FULL_BACKUP_PROMPT_COOLDOWN_MS = 5 * 24 * 60 * 60 * 1000;
+const ACTIVE_CONVERSATION_STORAGE_KEY = "kico_active_conversation_v1";
+const TRAVEL_PACK_RECENT_CONVERSATION_LIMIT = 3;
+const TRAVEL_PACK_CHRONICLE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface FullBackupStatus {
+  lastFullBackupAt?: number;
+  lastPromptedAt?: number;
+  lastSource?: "manual" | "auto-reminder" | "imported-backup";
+  lastBackupFingerprint?: string;
+  lastPromptFingerprint?: string;
+}
 
 export interface CottageFullBackup {
   meta: {
@@ -72,11 +90,135 @@ export interface CottageSettingsBackup {
   personaProfile: PersonaProfile;
 }
 
+export interface CottageTravelPack {
+  meta: {
+    schema: typeof TRAVEL_PACK_SCHEMA;
+    version: "1.0";
+    appName: "Kisera Cottage";
+    exportedAt: string;
+    backupType: "travel_pack";
+    schemaVersion: 1;
+    timezone: string;
+    sourceDeviceName?: string;
+    includedModules: string[];
+    excludedModules: string[];
+    itemCounts: Record<string, number>;
+    contentHash: string;
+  };
+  settings: UplinkSettings;
+  personaProfile: PersonaProfile;
+  conversations: ConversationRecord[];
+  memories: MemoryEntry[];
+  chronicles: ChronicleEntry[];
+  memorySeeds: MemorySeed[];
+  chroniclePreferences?: ChroniclePreferences;
+  continuityLine?: ContinuityLine;
+  sessionContinuity?: SessionContinuityStore;
+  watchRecords: WatchRecord[];
+  travelManifest: {
+    schemaVersion: 1;
+    appName: "Kisera Cottage";
+    exportedAt: string;
+    timezone: string;
+    sourceDeviceName?: string;
+    includedModules: string[];
+    excludedModules: string[];
+    itemCounts: Record<string, number>;
+    contentHash: string;
+  };
+}
+
 export interface CottageImportResult {
   kind: "full" | "settings";
   settings: UplinkSettings;
   personaProfile: PersonaProfile;
   report: string;
+}
+
+function readFullBackupStatus(): FullBackupStatus {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(FULL_BACKUP_STATUS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as FullBackupStatus;
+    return {
+      lastFullBackupAt: typeof parsed.lastFullBackupAt === "number" ? parsed.lastFullBackupAt : undefined,
+      lastPromptedAt: typeof parsed.lastPromptedAt === "number" ? parsed.lastPromptedAt : undefined,
+      lastSource: parsed.lastSource === "manual" || parsed.lastSource === "auto-reminder" || parsed.lastSource === "imported-backup"
+        ? parsed.lastSource
+        : undefined,
+      lastBackupFingerprint: typeof parsed.lastBackupFingerprint === "string" ? parsed.lastBackupFingerprint : undefined,
+      lastPromptFingerprint: typeof parsed.lastPromptFingerprint === "string" ? parsed.lastPromptFingerprint : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writeFullBackupStatus(status: FullBackupStatus): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(FULL_BACKUP_STATUS_KEY, JSON.stringify(status));
+  } catch {
+    // Backup reminders are helpful, but should never block the app.
+  }
+}
+
+function hasBackupWorthyData(): boolean {
+  try {
+    return exportConversationRecords().length > 0
+      || listMemoryEntries().length > 0
+      || exportChronicles().length > 0
+      || listMemorySeeds(true).length > 0
+      || exportWatchRecords().length > 0
+      || Boolean(getContinuityLine()?.content?.trim());
+  } catch {
+    return false;
+  }
+}
+
+function getBackupWorthyFingerprint(): string {
+  const payload = {
+    conversations: exportConversationRecords(),
+    memories: listMemoryEntries(),
+    chronicles: exportChronicles(),
+    memorySeeds: listMemorySeeds(true),
+    chroniclePreferences: getChroniclePreferences(),
+    continuityLine: getContinuityLine(),
+    sessionContinuity: exportSessionContinuity(),
+    watchRecords: exportWatchRecords(),
+  };
+  return createContentHash(payload);
+}
+
+export function shouldPromptFullBackup(now = Date.now()): boolean {
+  if (!hasBackupWorthyData()) return false;
+  const status = readFullBackupStatus();
+  const currentFingerprint = getBackupWorthyFingerprint();
+  if (status.lastBackupFingerprint && status.lastBackupFingerprint === currentFingerprint) return false;
+  if (status.lastFullBackupAt && now - status.lastFullBackupAt < FULL_BACKUP_REMINDER_INTERVAL_MS) return false;
+  if (status.lastPromptedAt && now - status.lastPromptedAt < FULL_BACKUP_PROMPT_COOLDOWN_MS) return false;
+  return true;
+}
+
+export function recordFullBackupPrompt(now = Date.now()): void {
+  writeFullBackupStatus({
+    ...readFullBackupStatus(),
+    lastPromptedAt: now,
+    lastPromptFingerprint: getBackupWorthyFingerprint(),
+  });
+}
+
+export function markFullBackupExported(now = Date.now(), source: FullBackupStatus["lastSource"] = "manual"): void {
+  const fingerprint = getBackupWorthyFingerprint();
+  writeFullBackupStatus({
+    ...readFullBackupStatus(),
+    lastFullBackupAt: now,
+    lastPromptedAt: now,
+    lastSource: source,
+    lastBackupFingerprint: fingerprint,
+    lastPromptFingerprint: fingerprint,
+  });
 }
 
 type LegacyBackupPayload = {
@@ -121,6 +263,94 @@ function keepLocalKeys(imported: UplinkSettings, current: UplinkSettings): Uplin
     next.memoryRetrieval.vectorOpenAIApiKey = current.memoryRetrieval.vectorOpenAIApiKey || "";
   }
   return next;
+}
+
+function getDeviceTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+  } catch {
+    return "local";
+  }
+}
+
+function getSourceDeviceName(): string | undefined {
+  try {
+    const platform = navigator?.platform || "";
+    if (platform) return platform;
+    return navigator?.userAgent ? navigator.userAgent.slice(0, 80) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function createContentHash(value: unknown): string {
+  const text = JSON.stringify(value);
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function readActiveConversationId(): string {
+  try {
+    return localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function stripConversationForTravel(conversation: ConversationRecord): ConversationRecord {
+  const next = cloneValue(conversation);
+  next.messages = (next.messages || []).map((message) => {
+    if (!message.attachments?.length) return message;
+    return {
+      ...message,
+      text: message.text?.trim() ? message.text : "[附件已在小旅行包中省略]",
+      attachments: undefined,
+    };
+  });
+  return next;
+}
+
+function selectTravelConversations(): ConversationRecord[] {
+  const conversations = exportConversationRecords()
+    .filter((conversation) => !conversation.linkedWatchRecordId && !conversation.linkedWatchTitle)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const selected: ConversationRecord[] = [];
+  const seen = new Set<string>();
+  const activeId = readActiveConversationId();
+
+  const add = (conversation?: ConversationRecord) => {
+    if (!conversation || seen.has(conversation.id) || selected.length >= TRAVEL_PACK_RECENT_CONVERSATION_LIMIT) return;
+    selected.push(conversation);
+    seen.add(conversation.id);
+  };
+
+  if (activeId) add(conversations.find((conversation) => conversation.id === activeId));
+  conversations.forEach(add);
+  return selected.map(stripConversationForTravel);
+}
+
+function selectRecentChronicles(): ChronicleEntry[] {
+  const cutoff = Date.now() - TRAVEL_PACK_CHRONICLE_WINDOW_MS;
+  return exportChronicles()
+    .filter((entry) => entry.isActive !== false && Number(entry.createdAt || 0) >= cutoff)
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function filterSessionContinuityForTravel(store: SessionContinuityStore, conversationIds: Set<string>): SessionContinuityStore {
+  return {
+    cards: Object.fromEntries(
+      Object.entries(store.cards || {}).filter(([sessionId]) => conversationIds.has(sessionId)),
+    ),
+    handoffs: Object.fromEntries(
+      Object.entries(store.handoffs || {}).filter(([, handoff]) => (
+        conversationIds.has(handoff.sourceSessionId) || conversationIds.has(handoff.targetSessionId)
+      )),
+    ),
+  };
 }
 
 function asObject(value: unknown): Record<string, any> {
@@ -181,6 +411,9 @@ function normalizeConversationMessage(raw: any, index: number) {
     createdAt: toIso(timestamp),
     attachments: attachments.length ? attachments : undefined,
     modelUsed: typeof raw?.modelUsed === "string" ? raw.modelUsed : undefined,
+    tokenCount: typeof raw?.tokenCount === "number" ? raw.tokenCount : undefined,
+    thoughts: typeof raw?.thoughts === "string" ? raw.thoughts : undefined,
+    thoughtsTranslated: typeof raw?.thoughtsTranslated === "string" ? raw.thoughtsTranslated : undefined,
   };
 }
 
@@ -231,6 +464,7 @@ function normalizeLegacyPersonaProfile(config: Record<string, any>): PersonaProf
       temperature: Number(persona?.temperature) || 0.75,
       contextDepth: Number(persona?.contextDepth) || 0,
       allowMemory: persona?.allowMemory !== false,
+      allowChronicles: persona?.allowChronicles !== false,
     })),
   };
   return normalizePersonaProfile(rawProfile);
@@ -269,6 +503,14 @@ function normalizeLegacySettings(config: Record<string, any>, currentSettings: U
   next.visual.metaShowDate = appearance.metaShowDate !== false;
   next.visual.metaShowModel = Boolean(appearance.metaShowModel);
   next.visual.metaShowTokens = appearance.metaShowTokens !== false;
+  next.visual.markdownNarrativeEnabled = typeof appearance.markdownNarrativeEnabled === "boolean"
+    ? appearance.markdownNarrativeEnabled
+    : true;
+  if (appearance.emojiFrequency === "low" || appearance.emojiFrequency === "medium" || appearance.emojiFrequency === "high") {
+    next.visual.emojiFrequency = appearance.emojiFrequency;
+  } else {
+    next.visual.emojiFrequency = "off";
+  }
 
   return keepLocalKeys(normalizeUplinkSettings(next), currentSettings);
 }
@@ -356,7 +598,7 @@ function normalizeLegacyContinuityLine(value: unknown, activePersonaId: string):
   };
 }
 
-export function createFullBackup(settings: UplinkSettings, personaProfile: PersonaProfile): CottageFullBackup {
+export async function createFullBackup(settings: UplinkSettings, personaProfile: PersonaProfile): Promise<CottageFullBackup> {
   return {
     meta: {
       schema: FULL_SCHEMA,
@@ -366,7 +608,7 @@ export function createFullBackup(settings: UplinkSettings, personaProfile: Perso
     },
     settings: safeSettings(settings),
     personaProfile: cloneValue(personaProfile),
-    conversations: exportConversationRecords(),
+    conversations: await hydrateConversationRecords(exportConversationRecords()),
     memories: listMemoryEntries(),
     chronicles: exportChronicles(),
     memorySeeds: listMemorySeeds(true),
@@ -391,7 +633,97 @@ export function createSettingsBackup(settings: UplinkSettings, personaProfile: P
   };
 }
 
-export function downloadBackup(filename: string, payload: CottageFullBackup | CottageSettingsBackup): void {
+export function createTravelPack(settings: UplinkSettings, personaProfile: PersonaProfile): CottageTravelPack {
+  const conversations = selectTravelConversations();
+  const conversationIds = new Set(conversations.map((conversation) => conversation.id));
+  const memories = listMemoryEntries();
+  const chronicles = selectRecentChronicles();
+  const memorySeeds = listMemorySeeds(true);
+  const sessionContinuity = filterSessionContinuityForTravel(exportSessionContinuity(), conversationIds);
+  const exportedAt = new Date().toISOString();
+  const timezone = getDeviceTimezone();
+  const sourceDeviceName = getSourceDeviceName();
+  const includedModules = [
+    "settings_without_api_keys",
+    "persona_core",
+    "text_memories",
+    "recent_3_daily_conversations",
+    "recent_7_days_chronicles",
+    "session_state_cards",
+    "continuity_line",
+    "memory_seed_candidates",
+  ];
+  const excludedModules = [
+    "api_keys",
+    "images",
+    "large_attachments",
+    "full_vector_index",
+    "obsidian_slices",
+    "cinema_large_data",
+    "watch_records",
+  ];
+  const itemCounts = {
+    conversations: conversations.length,
+    messages: conversations.reduce((sum, conversation) => sum + (conversation.messages?.length || 0), 0),
+    memories: memories.length,
+    chronicles: chronicles.length,
+    sessionStateCards: Object.keys(sessionContinuity.cards || {}).length,
+    memorySeeds: memorySeeds.length,
+  };
+
+  const pack: CottageTravelPack = {
+    meta: {
+      schema: TRAVEL_PACK_SCHEMA,
+      version: "1.0",
+      appName: "Kisera Cottage",
+      exportedAt,
+      backupType: "travel_pack",
+      schemaVersion: 1,
+      timezone,
+      sourceDeviceName,
+      includedModules,
+      excludedModules,
+      itemCounts,
+      contentHash: "",
+    },
+    settings: safeSettings(settings),
+    personaProfile: cloneValue(personaProfile),
+    conversations,
+    memories,
+    chronicles,
+    memorySeeds,
+    chroniclePreferences: getChroniclePreferences(),
+    continuityLine: getContinuityLine(),
+    sessionContinuity,
+    watchRecords: [],
+    travelManifest: {
+      schemaVersion: 1,
+      appName: "Kisera Cottage",
+      exportedAt,
+      timezone,
+      sourceDeviceName,
+      includedModules,
+      excludedModules,
+      itemCounts,
+      contentHash: "",
+    },
+  };
+
+  const contentHash = createContentHash({
+    ...pack,
+    meta: { ...pack.meta, contentHash: "" },
+    travelManifest: { ...pack.travelManifest, contentHash: "" },
+  });
+  pack.meta.contentHash = contentHash;
+  pack.travelManifest.contentHash = contentHash;
+  return pack;
+}
+
+export function downloadBackup(
+  filename: string,
+  payload: CottageFullBackup | CottageSettingsBackup | CottageTravelPack,
+  source: FullBackupStatus["lastSource"] = "manual",
+): void {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -401,9 +733,12 @@ export function downloadBackup(filename: string, payload: CottageFullBackup | Co
   link.click();
   link.remove();
   URL.revokeObjectURL(url);
+  if (payload.meta.schema === FULL_SCHEMA) {
+    markFullBackupExported(Date.now(), source);
+  }
 }
 
-function parsePayload(text: string): CottageFullBackup | CottageSettingsBackup | LegacyBackupPayload {
+function parsePayload(text: string): CottageFullBackup | CottageSettingsBackup | CottageTravelPack | LegacyBackupPayload {
   const payload = JSON.parse(text) as {
     meta?: { schema?: unknown };
     settings?: unknown;
@@ -414,22 +749,25 @@ function parsePayload(text: string): CottageFullBackup | CottageSettingsBackup |
     throw new Error("不是有效的 KI-CO / 羁星小屋备份文件。");
   }
   const schema = payload.meta.schema;
-  if (schema !== FULL_SCHEMA && schema !== SETTINGS_SCHEMA) {
+  if (schema !== FULL_SCHEMA && schema !== SETTINGS_SCHEMA && schema !== TRAVEL_PACK_SCHEMA) {
     throw new Error("备份版本无法识别，请选择由开源小屋或原版小屋导出的 JSON 文件。");
   }
-  return payload as unknown as CottageFullBackup | CottageSettingsBackup;
+  return payload as unknown as CottageFullBackup | CottageSettingsBackup | CottageTravelPack;
 }
 
 export function inspectBackupConversations(text: string): ConversationImportInspection | null {
   const payload = parsePayload(text);
   if (isLegacyFullBackup(payload)) {
     const converted = (payload.sessions || [])
-      .map((session, index) => normalizeConversationRecord(session, index))
+      .map((session, index) => normalizeConversationRecordForStorage(session, index))
       .filter(Boolean) as ConversationRecord[];
     return inspectConversationImport(converted);
   }
-  return payload.meta.schema === FULL_SCHEMA && Array.isArray((payload as CottageFullBackup).conversations)
-    ? inspectConversationImport((payload as CottageFullBackup).conversations)
+  return (payload.meta.schema === FULL_SCHEMA || payload.meta.schema === TRAVEL_PACK_SCHEMA)
+    && Array.isArray((payload as CottageFullBackup | CottageTravelPack).conversations)
+    ? inspectConversationImport(((payload as CottageFullBackup | CottageTravelPack).conversations || [])
+      .map((conversation, index) => normalizeConversationRecordForStorage(conversation, index))
+      .filter(Boolean) as ConversationRecord[])
     : null;
 }
 
@@ -437,15 +775,15 @@ function importLegacyBackup(
   payload: LegacyBackupPayload,
   currentSettings: UplinkSettings,
   conflictMode: ConversationImportConflictMode,
-): CottageImportResult {
+): Promise<CottageImportResult> {
   const config = asObject(payload.config);
   const importedSettings = normalizeLegacySettings(config, currentSettings);
   const personaProfile = normalizeLegacyPersonaProfile(config);
   const convertedConversations = (payload.sessions || [])
-    .map((session, index) => normalizeConversationRecord(session, index))
+    .map((session, index) => normalizeConversationRecordForStorage(session, index))
     .filter(Boolean) as ConversationRecord[];
 
-  const conversationReport = importConversationRecords(convertedConversations, conflictMode);
+  const conversationReportPromise = importConversationRecordsAsync(convertedConversations, conflictMode);
   const memoryReport = importMemoryJson(JSON.stringify(Array.isArray(payload.memories) ? payload.memories : []));
   const chronicleReport = importChronicles(Array.isArray(payload.chronicles) ? payload.chronicles : []);
 
@@ -465,36 +803,40 @@ function importLegacyBackup(
   const memorySeeds = normalizeLegacyMemorySeeds(continuity.memorySeeds);
   if (memorySeeds.length) saveMemorySeeds(memorySeeds);
 
-  const sessionContinuityReport = importSessionContinuity(
+  return conversationReportPromise.then((conversationReport) => {
+    const sessionContinuityReport = importSessionContinuity(
     normalizeLegacySessionContinuity(continuity),
     conversationReport.idMap,
-  );
-  const vectorReport = payload.vectorIndex
-    ? importVectorIndexBackup(JSON.stringify(payload.vectorIndex))
-    : { indexCount: 0, obsidianDocCount: 0 };
+    );
+    const vectorReport = payload.vectorIndex
+      ? importVectorIndexBackup(JSON.stringify(payload.vectorIndex))
+      : { indexCount: 0, obsidianDocCount: 0 };
 
-  return {
-    kind: "full",
-    settings: importedSettings,
-    personaProfile,
-    report: [
-      "已按原版小屋备份格式恢复。",
-      `对话：新增 ${conversationReport.added} 条，合并 ${conversationReport.merged} 条，副本 ${conversationReport.copied} 条，复用相同 ${conversationReport.reusedIdentical} 条。`,
-      `记忆库：新增 ${memoryReport.added} 条，合并 ${memoryReport.merged} 条。`,
-      `时光回廊：新增 ${chronicleReport.added} 篇，合并 ${chronicleReport.merged} 篇。`,
-      `窗口接续：恢复状态卡 ${sessionContinuityReport.cards} 张，接续便签 ${sessionContinuityReport.handoffs} 条。`,
-      `生活线：${continuityLine ? "已恢复" : "未发现可恢复内容"}；回忆种子：${memorySeeds.length} 条。`,
-      `向量索引：vectors ${vectorReport.indexCount} 条，Obsidian ${vectorReport.obsidianDocCount} 条。`,
-      "API Key 不随备份传输；当前设备已填写的 Key 会继续保留。",
-    ].join("\n"),
-  };
+    markFullBackupExported(Date.now(), "imported-backup");
+
+    return {
+      kind: "full",
+      settings: importedSettings,
+      personaProfile,
+      report: [
+        "已按原版小屋备份格式恢复。",
+        `对话：新增 ${conversationReport.added} 条，合并 ${conversationReport.merged} 条，副本 ${conversationReport.copied} 条，复用相同 ${conversationReport.reusedIdentical} 条。`,
+        `记忆库：新增 ${memoryReport.added} 条，合并 ${memoryReport.merged} 条。`,
+        `时光回廊：新增 ${chronicleReport.added} 篇，合并 ${chronicleReport.merged} 篇。`,
+        `窗口接续：恢复状态卡 ${sessionContinuityReport.cards} 张，接续便签 ${sessionContinuityReport.handoffs} 条。`,
+        `生活线：${continuityLine ? "已恢复" : "未发现可恢复内容"}；回忆种子：${memorySeeds.length} 条。`,
+        `向量索引：vectors ${vectorReport.indexCount} 条，Obsidian ${vectorReport.obsidianDocCount} 条。`,
+        "API Key 不随备份传输；当前设备已填写的 Key 会继续保留。",
+      ].join("\n"),
+    };
+  });
 }
 
-export function importBackup(
+export async function importBackup(
   text: string,
   currentSettings: UplinkSettings,
   conflictMode: ConversationImportConflictMode = "merge",
-): CottageImportResult {
+): Promise<CottageImportResult> {
   const payload = parsePayload(text);
   if (isLegacyFullBackup(payload)) {
     return importLegacyBackup(payload, currentSettings, conflictMode);
@@ -511,9 +853,14 @@ export function importBackup(
     };
   }
 
-  const fullPayload = payload as CottageFullBackup;
-  const conversationReport = importConversationRecords(
-    Array.isArray(fullPayload.conversations) ? fullPayload.conversations : [],
+  const isTravelPack = payload.meta.schema === TRAVEL_PACK_SCHEMA;
+  const fullPayload = payload as CottageFullBackup | CottageTravelPack;
+  const conversationReport = await importConversationRecordsAsync(
+    Array.isArray(fullPayload.conversations)
+      ? fullPayload.conversations
+        .map((conversation, index) => normalizeConversationRecordForStorage(conversation, index))
+        .filter(Boolean) as ConversationRecord[]
+      : [],
     conflictMode,
   );
   const memoryReport = importMemoryJson(JSON.stringify(Array.isArray(fullPayload.memories) ? fullPayload.memories : []));
@@ -525,15 +872,18 @@ export function importBackup(
     ? importSessionContinuity(fullPayload.sessionContinuity, conversationReport.idMap)
     : { cards: 0, handoffs: 0 };
   const watchReport = importWatchRecords(Array.isArray(fullPayload.watchRecords) ? fullPayload.watchRecords : []);
-  const vectorReport = fullPayload.vectorIndex
+  const vectorReport = "vectorIndex" in fullPayload && fullPayload.vectorIndex
     ? importVectorIndexBackup(JSON.stringify(fullPayload.vectorIndex))
     : { indexCount: 0, obsidianDocCount: 0 };
+
+  markFullBackupExported(Date.now(), "imported-backup");
 
   return {
     kind: "full",
     settings: importedSettings,
     personaProfile,
     report: [
+      ...(isTravelPack ? ["小旅行包已导入：轻量接续包不含 API Key、图片、大附件和向量索引。"] : []),
       "恢复成功。",
       `对话：新增 ${conversationReport.added} 条，合并 ${conversationReport.merged} 条，副本 ${conversationReport.copied} 条，复用相同 ${conversationReport.reusedIdentical} 条。`,
       `记忆库：新增 ${memoryReport.added} 条，合并 ${memoryReport.merged} 条。`,

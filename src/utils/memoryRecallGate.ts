@@ -1,3 +1,6 @@
+const HISTORICAL_MEMORY_HINT_PATTERN = /\u5f53\u521d|\u5f53\u65f6|\u90a3\u65f6\u5019|\u90a3\u4f1a\u513f|\u6700\u5f00\u59cb|\u4e00\u5f00\u59cb|\u66fe\u7ecf|\u65e9\u4e9b\u65f6\u5019|back then|at the time|originally/i;
+const DIRECT_MEMORY_ANCHOR_PATTERN = /(?:[a-z][a-z0-9_-]{2,}.*(?:\u90a3\u4e8b|\u90a3\u4ef6\u4e8b|\u4e8b\u60c5|\u4e8b\u4ef6|\u95ee\u9898|thing|issue|case))|(?:[\p{Script=Han}a-z0-9_-]{2,}(?:\u7eaa\u5143|\u8ba1\u5212|\u9879\u76ee|\u4e8b\u4ef6|\u4e8b\u60c5|\u90a3\u4e8b|\u90a3\u4ef6\u4e8b|\u8bbe\u5b9a|\u62a5\u4ef7|\u7a97\u53e3|\u65e5\u8bb0|\u8bb0\u5fc6|\u5c0f\u5c4b|\u7f13\u5b58|\u53ec\u56de|\u7d22\u5f15|\u5b89\u5168|safety))/iu;
+
 const MEMORY_HINT_PATTERN = new RegExp([
   "还记得", "记得吗", "记不记得", "之前", "以前", "上次", "那次", "刚才", "我们说过", "你说过", "我说过",
   "暗号", "锚点", "人格核", "记忆", "回忆", "状态卡", "生活线", "日记", "长期记忆", "小屋", "开源", "项目", "客户", "合同",
@@ -6,6 +9,7 @@ const MEMORY_HINT_PATTERN = new RegExp([
 ].join("|"), "i");
 
 const QUESTION_PATTERN = /[?？]|^(为什么|怎么|咋|如何|能不能|可不可以|是不是|要不要|怎么办|which|what|why|how|can|should)\b/i;
+const TIME_BRIDGE_DIAGNOSTIC_PATTERN = /time\s*bridge|time\s*awareness|时间桥|时间感知/i;
 
 // 这些输入通常只是承接、回应或亲昵小动作，不值得为它们单独触发 RAG / embedding。
 // 这里匹配的是“去掉标点、emoji、颜文字符号后的规范文本”。
@@ -82,7 +86,11 @@ export function shouldRetrieveMemory(query: string, options: MemoryRecallGateOpt
   const normalized = normalizeRecallText(query);
   if (!normalized) return false;
 
+  if (TIME_BRIDGE_DIAGNOSTIC_PATTERN.test(normalized)) return true;
+
   if (MEMORY_HINT_PATTERN.test(normalized)) return true;
+  if (HISTORICAL_MEMORY_HINT_PATTERN.test(normalized)) return true;
+  if (DIRECT_MEMORY_ANCHOR_PATTERN.test(normalized)) return true;
 
   const meaningfulLength = roughMeaningfulLength(normalized);
   const isLowSignal = isLowSignalText(normalized);

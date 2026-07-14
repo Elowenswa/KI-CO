@@ -31,6 +31,15 @@ function renderInline(text: string): ReactNode[] {
   return parts;
 }
 
+function renderHeading(level: number, content: ReactNode[], key: string) {
+  if (level <= 1) return <h1 key={key}>{content}</h1>;
+  if (level === 2) return <h2 key={key}>{content}</h2>;
+  if (level === 3) return <h3 key={key}>{content}</h3>;
+  if (level === 4) return <h4 key={key}>{content}</h4>;
+  if (level === 5) return <h5 key={key}>{content}</h5>;
+  return <h6 key={key}>{content}</h6>;
+}
+
 export function MarkdownText({ text, className = "cottage-markdown" }: MarkdownTextProps) {
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   const blocks: ReactNode[] = [];
@@ -57,6 +66,12 @@ export function MarkdownText({ text, className = "cottage-markdown" }: MarkdownT
 
     if (/^[-*_]{3,}$/.test(trimmed)) {
       blocks.push(<hr key={`hr-${index}`} />);
+      continue;
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.+)$/.exec(trimmed);
+    if (headingMatch) {
+      blocks.push(renderHeading(headingMatch[1].length, renderInline(headingMatch[2].trim()), `heading-${index}`));
       continue;
     }
 
@@ -111,6 +126,7 @@ export function MarkdownText({ text, className = "cottage-markdown" }: MarkdownT
       lines[index + 1].trim() &&
       !lines[index + 1].trim().startsWith("```") &&
       !lines[index + 1].trim().startsWith(">") &&
+      !/^(#{1,6})\s+/.test(lines[index + 1].trim()) &&
       !/^[-*]\s+/.test(lines[index + 1].trim()) &&
       !/^\d+\.\s+/.test(lines[index + 1].trim()) &&
       !/^[-*_]{3,}$/.test(lines[index + 1].trim())

@@ -33,20 +33,21 @@ import {
   getVectorBuildStatus,
   getVectorIndexGuideStatus,
   getVectorOnDemandStatus,
-  importObsidianDocs,
   importVectorIndexBackup,
   rebuildVectorIndex,
   retrieveMemorySnippetsDetailed,
   subscribeContextRetrievalHistory,
   subscribeVectorStore,
+  syncObsidianChunks,
   type ContextRetrievalTurn,
   type LocalRetrievalDebugResult,
-  type SourceDoc,
+  type ObsidianChunkInput,
 } from "../storage/memoryBank";
 import {
   clearPromptCacheStats,
   getPromptCacheStats,
   subscribePromptCacheStats,
+  type PromptCacheTurnStat,
 } from "../storage/promptCacheStats";
 import type { MemoryRetrievalSettings, MemorySnippet, ObsidianScopeMode, UplinkSettings, VectorProvider } from "../types";
 import { getActivePersona, loadPersonaProfile } from "../storage/personaProfile";
@@ -195,8 +196,39 @@ function sourceLabel(source = "") {
   return SOURCE_LABELS[source] || source || "本地";
 }
 
+function retrievalSkipReasonLabel(reason?: string) {
+  if (reason === "memory_recall_disabled") return "记忆召回开关关闭";
+  if (reason === "persona_memory_disabled") return "人格档案记忆库关闭";
+  if (reason === "memory_recall_gate_skipped") return "自然延续";
+  if (reason?.startsWith("topic_gate_rag_action_none:")) return "自然延续";
+  if (reason?.startsWith("topic_gate_reuse:")) return "复用上一组记忆包";
+  return reason || "";
+}
+
 function timeLabel(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function cacheChannelLabel(turn: PromptCacheTurnStat) {
+  if (turn.requestChannel === "journal") return "日记通道";
+  if (turn.cacheScope?.startsWith("chronicle:")) return "日记通道";
+  if (turn.cacheScope?.startsWith("session-state:")) return "状态卡";
+  if (turn.requestChannel === "chat") return "主对话";
+  return turn.requestChannel || "主对话";
+}
+
+function cacheScopeLabel(scope?: string) {
+  if (!scope) return "";
+  if (scope.startsWith("chronicle:")) return "scope=chronicle";
+  if (scope.startsWith("session-state:")) return "scope=session-state";
+  return scope.length > 30 ? `scope=${scope.slice(0, 27)}...` : `scope=${scope}`;
+}
+
+function cacheStatusLabel(turn: PromptCacheTurnStat) {
+  if (turn.cachedTokens > 0) return "命中";
+  if (turn.cacheControlSkipReason) return "未命中";
+  if (turn.providerCacheMode?.includes("auto")) return "待服务商返回";
+  return "未命中";
 }
 
 function readStoredValue(key: string, fallback: string): string {
@@ -391,6 +423,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
   const snippetChars = selectedSnippets.reduce((sum, item) => sum + item.text.length, 0);
   const latestContextTurn = contextTurns[0] ?? null;
   const liveSnippets = latestContextTurn?.snippets ?? [];
+  const latestSkipReason = retrievalSkipReasonLabel(latestContextTurn?.skipReason);
   const openRouterProfile = settings.profiles.openrouter;
   const hasOpenRouterKey = !!openRouterProfile.apiKey.trim();
   const isOpenRouterLinked = hasOpenRouterKey && retrieval.vectorUseOpenRouterProfile && retrieval.vectorProvider === "openai";
@@ -463,6 +496,17 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
         sourceMix[key] = (sourceMix[key] || 0) + 1;
       });
     });
+    const isExpectedNoRecallNotice = (turn: ContextRetrievalTurn) => {
+      const reason = String(turn.skipReason || turn.error || "").trim().toLowerCase();
+      return (
+        reason === "memory_recall_gate_skipped" ||
+        reason.startsWith("topic_gate_rag_action_none:") ||
+        reason.startsWith("topic_gate_memory_action_none:") ||
+        reason === "memory_action_none" ||
+        reason === "topic_gate_reuse_without_existing_memory_set" ||
+        reason === "topic_gate_reuse_without_existing_set"
+      );
+    };
     return {
       windowSize: 30,
       sampleCount,
@@ -471,7 +515,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
       avgEstimatedTokens: sampleCount ? Math.round(totalEstimatedTokens / sampleCount) : 0,
       totalEstimatedTokens,
       fallbackRate: sampleCount ? (contextTurns.filter((turn) => turn.snippets.length === 0).length / sampleCount) * 100 : 0,
-      errorRate: contextTurns.length ? (contextTurns.filter((turn) => !!turn.error).length / contextTurns.length) * 100 : 0,
+      errorRate: contextTurns.length ? (contextTurns.filter((turn) => !!turn.error && !isExpectedNoRecallNotice(turn)).length / contextTurns.length) * 100 : 0,
       duplicateRate: totalInjectedCount ? (duplicateCount / totalInjectedCount) * 100 : 0,
       avgInjectedCount: sampleCount ? totalInjectedCount / sampleCount : 0,
       sourceMix,
@@ -622,14 +666,22 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
         : [];
       if (obsidianFolders.length && !includeFolders.length) throw new Error("请先勾选至少一个要同步的文件夹。");
       const files = await requestBridgeJson<ObsidianBridgeFilesResponse>(bridgeUrl, "/api/obsidian/files", { rootPath: root, includeFolders });
+      const totalFiles = Math.max(0, Number(files.totalFiles || 0));
+      clearObsidianDocs();
+      if (totalFiles === 0) {
+        setObsidianMeta(getObsidianDocMeta());
+        setBridgeInfo("没有发现 .md 文件。已清空旧 Obsidian 索引。");
+        return;
+      }
       let offset = 0;
       let totalChunks = 0;
-      const docs: Partial<SourceDoc>[] = [];
+      let indexedChunks = 0;
+      let reusedChunks = 0;
       const fileLimit = 80;
-      while (offset < files.totalFiles) {
+      while (offset < totalFiles) {
         const payload = await requestBridgeJson<{
           ok: boolean;
-          chunks: Array<Partial<SourceDoc> & { noteId?: string; chunkId?: string }>;
+          chunks: ObsidianChunkInput[];
           nextOffset: number;
           processedFiles: number;
           totalFiles: number;
@@ -641,23 +693,18 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
           chunkOverlap: 120,
           includeFolders,
         });
-        payload.chunks.forEach((chunk, index) => {
-          const sourceId = String(chunk.sourceId || chunk.noteId || chunk.id || `obsidian-${offset}-${index}`);
-          docs.push({
-            ...chunk,
-            id: String(chunk.id || chunk.chunkId || `obsidian_note:${sourceId}:${index}`),
-            sourceType: "obsidian_note",
-            sourceId,
-            parentId: String(chunk.parentId || sourceId),
-          });
-        });
-        totalChunks += payload.chunks.length;
+        const chunks = Array.isArray(payload.chunks) ? payload.chunks : [];
+        totalChunks += chunks.length;
+        if (chunks.length > 0) {
+          const report = await syncObsidianChunks(settings, chunks);
+          indexedChunks += Number(report.indexed || 0);
+          reusedChunks += Number(report.reused || 0);
+        }
         offset = payload.nextOffset > offset ? payload.nextOffset : offset + payload.processedFiles;
-        setBridgeInfo(`同步中：${Math.min(offset, files.totalFiles)}/${files.totalFiles} 文件 · chunks=${totalChunks}`);
+        setBridgeInfo(`同步中：${Math.min(offset, totalFiles)}/${totalFiles} 文件 · chunks=${totalChunks} · indexed=${indexedChunks} · reused=${reusedChunks}`);
       }
-      const report = importObsidianDocs(docs);
       setObsidianMeta(getObsidianDocMeta());
-      setBridgeInfo(`同步完成：新增 ${report.added} 条，当前 ${report.total} 条。建议点击“重建索引”。`);
+      setBridgeInfo(`同步完成：文件 ${totalFiles} 个，切片 ${totalChunks} 条，已入索引 ${indexedChunks} 条，复用 ${reusedChunks} 条。`);
     } catch (error) {
       setBridgeError(error instanceof Error ? error.message : "同步失败");
     } finally {
@@ -944,16 +991,16 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
             {renderPanelHeader("indexStatus", <Wrench size={17} />, "索引状态", indexGuide.needsRebuild ? `待建立 ${indexGuide.totalDocs - indexGuide.reusableCount} 条` : `state=${buildStatus.state} | ${buildStatus.progress}%`)}
             {openPanels.indexStatus ? (
               <div className="vector-panel-body">
-                <div className="vector-test-actions">
+                <div className="vector-test-actions vector-index-actions">
                   <button type="button" className={`vector-action-primary vector-rebuild-button ${indexGuide.needsRebuild && buildStatus.state !== "running" ? "needs-attention" : ""}`} onClick={handleRebuildIndex} disabled={buildStatus.state === "running"}>
                     <span className="vector-rebuild-particles" aria-hidden="true"><i /><i /><CottageStar /></span>
                     <RefreshCcw size={16} className={buildStatus.state === "running" ? "vector-spin" : ""} />
-                    {buildStatus.state === "running" ? `建立中 ${buildStatus.progress}%` : "重建索引"}
+                    {buildStatus.state === "running" ? `${buildStatus.progress}%` : "重建"}
                   </button>
-                  <button type="button" className="secondary" onClick={() => downloadVectorIndexBackup()}><Download size={16} />导出索引</button>
+                  <button type="button" className="secondary" onClick={() => downloadVectorIndexBackup()}><Download size={16} />导出</button>
                   <label className="vector-clear-button">
                     <Upload size={16} />
-                    导入索引
+                    导入
                     <input
                       type="file"
                       accept="application/json,.json"
@@ -964,7 +1011,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
                       }}
                     />
                   </label>
-                  <button type="button" className="ghost" onClick={handleClearIndex}><CircleSlash size={16} />清空索引</button>
+                  <button type="button" className="ghost" onClick={handleClearIndex}><CircleSlash size={16} />清空</button>
                 </div>
                 {indexNotice ? <div className={`vector-index-notice ${buildStatus.state === "error" ? "error" : ""}`}>{indexNotice}</div> : null}
                 <div className="vector-debug-block">
@@ -1070,21 +1117,96 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
                 <div className="vector-trace-card compact">
                   <div className="vector-trace-head">
                     <strong>实时上下文轨迹</strong>
-                    {latestContextTurn ? <span className={latestContextTurn.cacheHit ? "vector-pill hit" : "vector-pill miss"}>{latestContextTurn.cacheHit ? "cache hit" : "cache miss"} · {latestContextTurn.elapsedMs}ms</span> : <span className="vector-pill">等待对话</span>}
+                    {latestContextTurn ? (
+                      <span className={latestContextTurn.skipReason ? "vector-pill hit" : latestContextTurn.cacheHit ? "vector-pill hit" : "vector-pill miss"}>
+                        {latestContextTurn.skipReason ? `skipped · ${latestSkipReason}` : `${latestContextTurn.cacheHit ? "cache hit" : "cache miss"} · ${latestContextTurn.elapsedMs}ms`}
+                      </span>
+                    ) : <span className="vector-pill">等待对话</span>}
                   </div>
-                  <p>source mix: {liveSourceMix.length ? liveSourceMix.join(" / ") : "none"}</p>
-                  <p>query: {latestContextTurn?.query || "尚未产生实际对话检索"}</p>
+                  {latestContextTurn ? (
+                    <>
+                      <div className="vector-trace-grid">
+                        <span>time</span>
+                        <strong>{new Date(latestContextTurn.timestamp).toLocaleString()}</strong>
+                        <span>mode</span>
+                        <strong>{latestContextTurn.mode || "-"}</strong>
+                        <span>provider</span>
+                        <strong>{latestContextTurn.provider || "-"}</strong>
+                        <span>cache</span>
+                        <strong>{latestContextTurn.cacheHit ? "hit" : "miss"}</strong>
+                        <span>query</span>
+                        <strong>{latestContextTurn.query || "-"}</strong>
+                        <span>recall / injected</span>
+                        <strong>{latestContextTurn.candidateCount} / {latestContextTurn.snippets.length}</strong>
+                        <span>limit / tokens</span>
+                        <strong>{latestContextTurn.retrievalLimit ?? "-"} / {latestContextTurn.estimatedTokens || 0}</strong>
+                        <span>source</span>
+                        <strong>{liveSourceMix.length ? liveSourceMix.join(" / ") : "none"}</strong>
+                        <span>docs</span>
+                        <strong>{latestContextTurn.totalEntries}</strong>
+                        <span>threshold</span>
+                        <strong>{latestContextTurn.vectorScoreThreshold ?? "-"}</strong>
+                        <span>topK / memoryLimit</span>
+                        <strong>{latestContextTurn.vectorTopK ?? "-"} / {latestContextTurn.memorySnippetLimit ?? "-"}</strong>
+                        <span>topic</span>
+                        <strong>{latestContextTurn.topicRelation || "-"}</strong>
+                        <span>rag action</span>
+                        <strong>{latestContextTurn.ragAction || "-"}</strong>
+                        <span>decision</span>
+                        <strong>{latestContextTurn.topicGateDecision || "-"}</strong>
+                        <span>set hash</span>
+                        <strong>{latestContextTurn.topicMemorySetHash || "-"}</strong>
+                        <span>turns / reused</span>
+                        <strong>{latestContextTurn.turnsSinceRefresh ?? "-"} / {latestContextTurn.reusedMemoryCount ?? "-"}</strong>
+                        <span>reason</span>
+                        <strong>{latestContextTurn.noRagReason || latestContextTurn.reuseReason || latestContextTurn.supplementReason || latestContextTurn.refreshReason || "-"}</strong>
+                        <span>supplement</span>
+                        <strong>
+                          {`skip=${latestContextTurn.supplementSkippedReason || "-"} / cooldown=${latestContextTurn.supplementCooldownRemaining ?? 0} / merged=${latestContextTurn.supplementMergedNewCount ?? "-"}`}
+                        </strong>
+                        <span>hash reason</span>
+                        <strong>{latestContextTurn.topicMemoryHashChangedBecause || "-"}</strong>
+                      </div>
+                      {latestContextTurn.skipReason ? (
+                        <div className="vector-trace-notice">
+                          <span />
+                          <strong>{latestSkipReason}</strong>
+                        </div>
+                      ) : null}
+                      {(latestContextTurn.candidates?.length || latestContextTurn.explanation?.length || latestContextTurn.tokens?.length) ? (
+                        <details className="vector-trace-diagnostics">
+                          <summary>候选诊断</summary>
+                          {latestContextTurn.tokens?.length ? <p>tokens={latestContextTurn.tokens.join(" / ")}</p> : null}
+                          {latestContextTurn.explanation?.slice(0, 4).map((line) => <p key={line}>{line}</p>)}
+                          {latestContextTurn.candidates?.slice(0, 5).map((candidate, index) => (
+                            <p key={`${candidate.id}-live-candidate-${index}`}>
+                              {`#${index + 1} ${sourceLabel(candidate.source)} | score=${formatScore(candidate.fusedScoreAfterRerank ?? candidate.score)} | vector=${formatScore(candidate.vectorScore)} | ${candidate.selected ? "selected" : "candidate"} | ${candidate.title} | matched=${candidate.matchedTokens.join(" / ") || "-"}`}
+                            </p>
+                          ))}
+                        </details>
+                      ) : null}
+                    </>
+                  ) : null}
                 </div>
                 {liveSnippets.length ? (
                   <div className="vector-trace-list">
                     {liveSnippets.map((snippet, index) => (
                       <article key={`${snippet.id}-trace-${index}`}>
                         <span>{index + 1}</span>
-                        <div><strong>{snippet.title}</strong><p>{excerpt(snippet.text, 150)}</p></div>
+                        <div>
+                          <div className="vector-context-meta">
+                            <span>{`source=${sourceLabel(snippet.source || "memory-bank")}`}</span>
+                            <span>{`score=${formatScore(snippet.score)}`}</span>
+                            <span>{`token~${estimateTokens(`${snippet.title}\n${snippet.text}`)}`}</span>
+                            <span>{`len=${snippet.text.length}`}</span>
+                          </div>
+                          <strong>{snippet.title}</strong>
+                          <p>{excerpt(snippet.text, 150)}</p>
+                        </div>
                       </article>
                     ))}
                   </div>
-                ) : <div className="vector-empty">实时上下文暂无召回。开启人格核中的记忆库后发送一条对话，这里会显示本轮实际注入内容。</div>}
+                ) : <div className={`vector-empty ${latestSkipReason ? "vector-rag-skip-note" : ""}`}>{latestSkipReason ? `本轮没有额外 RAG：${latestSkipReason}。人格核、状态卡和最近对话仍会正常进入上下文。` : "实时上下文暂无召回。开启人格核中的记忆库后发送一条有明确记忆线索的对话，这里会显示本轮实际注入内容。"}</div>}
               </div>
             ) : null}
           </section>
@@ -1093,6 +1215,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
             {renderPanelHeader("cacheStats", <Gauge size={17} />, "每轮缓存命中统计", `最近 ${promptCacheStats.windowSize} 轮（样本=${promptCacheStats.sampleCount}）`, <button type="button" className="vector-compact-button" onClick={handleClearPromptCacheStats}>清空</button>)}
             {openPanels.cacheStats ? (
               <div className="vector-panel-body">
+                <p className="vector-cache-window-line">统计窗口：最近 {promptCacheStats.windowSize} 轮（样本={promptCacheStats.sampleCount}）</p>
                 <div className="vector-stat-grid vector-stat-grid-wide">
                   <div><strong>{Math.round(promptCacheStats.totalInputTokens)}</strong><span>输入 Token(总)</span></div>
                   <div><strong>{Math.round(promptCacheStats.totalCachedTokens)}</strong><span>缓存 Token(总)</span></div>
@@ -1104,25 +1227,49 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
                 <p className="vector-cache-footnote">按服务商 usage 返回的真实缓存 Token 统计；接口未返回时显示 0。</p>
                 {promptCacheStats.turns.length ? (
                   <div className="vector-cache-turns">
-                    {promptCacheStats.turns.slice(0, 8).map((turn) => (
-                      <article key={`${turn.ts}-${turn.provider}-${turn.model}`}>
-                        <div className="vector-cache-turn-line">
-                          <span>{timeLabel(turn.ts)}</span>
-                          <span>{turn.provider}</span>
-                          <span>{turn.model}</span>
-                          <span>in={turn.inputTokens}</span>
-                          <span>cached={turn.cachedTokens}</span>
-                          <span>saved={formatPercent(turn.savingsRatio * 100)}</span>
-                          {turn.cacheStrategy ? <span>{turn.cacheStrategy}</span> : null}
-                          {turn.cacheablePrefixTokens ? (
-                            <span>
-                              prefix≈{turn.cacheablePrefixTokens}
-                              {turn.cacheablePrefixMinTokens ? ` / min ${turn.cacheablePrefixMinTokens}` : ""}
-                            </span>
-                          ) : null}
-                        </div>
-                      </article>
-                    ))}
+                    {promptCacheStats.turns.slice(0, 8).map((turn) => {
+                      const scope = cacheScopeLabel(turn.cacheScope);
+                      const cacheTone =
+                        turn.cachedTokens <= 0
+                          ? "miss"
+                          : turn.savingsRatio >= 0.6
+                            ? "hit hit-high"
+                            : turn.savingsRatio >= 0.3
+                              ? "hit hit-mid"
+                              : "hit hit-low";
+                      return (
+                        <article key={`${turn.ts}-${turn.provider}-${turn.model}`} className={`vector-cache-turn-card ${cacheTone}`}>
+                          <div className="vector-cache-card-head">
+                            <div>
+                              <span>{timeLabel(turn.ts)} · {turn.provider}</span>
+                              <strong>{turn.model}</strong>
+                            </div>
+                            <i>{cacheStatusLabel(turn)}</i>
+                          </div>
+                          <div className="vector-cache-token-strip">
+                            <div><span>输入</span><strong>{turn.inputTokens}</strong></div>
+                            <div><span>缓存</span><strong>{turn.cachedTokens}</strong></div>
+                            <div><span>节省</span><strong>{formatPercent(turn.savingsRatio * 100)}</strong></div>
+                          </div>
+                          <div className="vector-cache-debug-chips">
+                            <span>{cacheChannelLabel(turn)}</span>
+                            {scope ? <span>{scope}</span> : null}
+                            {turn.providerCacheMode ? <span>{turn.providerCacheMode}</span> : null}
+                            {typeof turn.cacheControlUsed === "boolean" ? <span>cache_control={turn.cacheControlUsed ? "yes" : "no"}</span> : null}
+                            {turn.cacheControlTtl ? <span>ttl={turn.cacheControlTtl}</span> : null}
+                            {turn.cacheControlSkipReason ? <span>skip={turn.cacheControlSkipReason}</span> : null}
+                            {turn.cacheStrategy ? <span>{turn.cacheStrategy}</span> : null}
+                            {turn.cacheBreakpointBlock ? <span>break={turn.cacheBreakpointBlock}</span> : null}
+                            {turn.cacheablePrefixTokens ? (
+                              <span>
+                                prefix≈{turn.cacheablePrefixTokens}
+                                {turn.cacheablePrefixMinTokens ? ` / min ${turn.cacheablePrefixMinTokens}` : ""}
+                              </span>
+                            ) : null}
+                          </div>
+                        </article>
+                      );
+                    })}
                   </div>
                 ) : <div className="vector-empty">暂无模型缓存统计。先发送几轮真实模型对话，再回来查看服务商返回的缓存命中。</div>}
               </div>

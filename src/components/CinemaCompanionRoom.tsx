@@ -1582,6 +1582,10 @@ export function CinemaCompanionRoom({
         dynamicContext: buildTimeAwarenessContext(uplinkSettings),
         memories,
         recentMessages,
+        replyAesthetics: {
+          markdownNarrativeEnabled: uplinkSettings.visual.markdownNarrativeEnabled,
+          emojiFrequency: uplinkSettings.visual.emojiFrequency,
+        },
         onStreamUpdate: (text) => {
           setMessages((items) => {
             const exists = items.some((message) => message.id === companionMessageId);

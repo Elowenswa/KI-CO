@@ -63,6 +63,8 @@ export type MemoryRetrievalMode = "local" | "vector" | "hybrid";
 export type VectorProvider = "none" | "local" | "openai" | "gemini";
 export type ObsidianScopeMode = "all" | "persona" | "book" | "custom";
 export type TimeAwarenessMode = "off" | "date_only" | "realtime";
+export type ClaudeCacheTtlMode = "auto" | "5m" | "1h";
+export type EmojiFrequency = "off" | "low" | "medium" | "high";
 
 export interface ModelPreset {
   id: string;
@@ -126,6 +128,8 @@ export interface VisualAtmosphereSettings {
   customBackgroundDataUrl: string;
   fontStyle: FontStylePreset;
   fontSize: FontSizePreset;
+  markdownNarrativeEnabled: boolean;
+  emojiFrequency: EmojiFrequency;
   showBilingualLabels: boolean;
   showStatusStrip: boolean;
   showButtonLabels: boolean;
@@ -139,6 +143,9 @@ export interface VisualAtmosphereSettings {
 export interface UplinkSettings {
   activeProvider: ModelProvider;
   journalProvider: JournalProvider;
+  claudeCacheTtlMode: ClaudeCacheTtlMode;
+  enableReasoning: boolean;
+  reasoningPreferChinese: boolean;
   temperature: number;
   stream: boolean;
   profiles: Record<ModelProvider, ProviderProfile>;
@@ -174,8 +181,21 @@ export interface CompanionRequest {
   dynamicContext?: string;
   memories: MemorySnippet[];
   recentMessages?: ConversationTurn[];
+  replyAesthetics?: {
+    markdownNarrativeEnabled?: boolean;
+    emojiFrequency?: EmojiFrequency;
+  };
+  timeBridgeMeta?: TimeBridgeMeta;
   onStreamUpdate?: (text: string) => void;
+  onMetaUpdate?: (meta: { thoughts?: string; thoughtsTranslated?: string }) => void;
   signal?: AbortSignal;
+}
+
+export interface TimeBridgeMeta {
+  previousUserGapMs?: number;
+  recentUserAverageGapMs?: number;
+  previousUserMessageAt?: string;
+  currentUserMessageAt?: string;
 }
 
 export interface CompanionResponse {
@@ -183,6 +203,8 @@ export interface CompanionResponse {
   promptPreview?: string;
   modelUsed?: string;
   tokenCount?: number;
+  thoughts?: string;
+  thoughtsTranslated?: string;
 }
 
 export interface LLMAdapter {
@@ -213,6 +235,8 @@ export interface ConversationMessage {
   attachments?: ConversationAttachment[];
   modelUsed?: string;
   tokenCount?: number;
+  thoughts?: string;
+  thoughtsTranslated?: string;
 }
 
 export interface ConversationAttachment {

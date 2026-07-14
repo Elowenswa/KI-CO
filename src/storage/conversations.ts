@@ -1,7 +1,9 @@
 import type { ConversationMessage, ConversationRecord } from "../types";
 import { slugifyTitle } from "../utils/time";
+import { imageDB } from "../utils/imageDB";
 
 const STORAGE_KEY = "kisera_cinema_conversations_v1";
+const MAX_STORED_CONVERSATIONS = 120;
 
 export type ConversationImportConflictMode = "merge" | "copy";
 
@@ -29,19 +31,205 @@ function createId(prefix = "chat") {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function isQuotaExceeded(error: unknown) {
+  const event = error as { name?: string; message?: string };
+  return event?.name === "QuotaExceededError" || String(event?.message || "").toLowerCase().includes("quota");
+}
+
+function toIso(value: unknown, fallback = Date.now()): string {
+  const time = typeof value === "number"
+    ? value < 1_000_000_000_000 ? value * 1000 : value
+    : typeof value === "string"
+      ? new Date(value).getTime()
+      : fallback;
+  return new Date(Number.isFinite(time) && time > 0 ? time : fallback).toISOString();
+}
+
+function normalizeRole(role: unknown): ConversationMessage["role"] {
+  const value = String(role || "").trim().toLowerCase();
+  if (value === "user" || value === "human") return "user";
+  return "companion";
+}
+
+function dataUrlSize(dataUrl: string) {
+  const base64 = dataUrl.split(",")[1] || "";
+  return Math.max(0, Math.round((base64.length * 3) / 4));
+}
+
+function isImageDbRef(value = "") {
+  return value.startsWith("indexeddb://");
+}
+
+function normalizeAttachment(raw: any, index: number): NonNullable<ConversationMessage["attachments"]>[number] | null {
+  if (!raw || typeof raw !== "object") return null;
+  const rawType = String(raw.type || "").toLowerCase();
+  const dataUrl = typeof raw.dataUrl === "string"
+    ? raw.dataUrl
+    : typeof raw.content === "string" && (raw.content.startsWith("data:") || isImageDbRef(raw.content))
+      ? raw.content
+      : "";
+  const text = typeof raw.text === "string"
+    ? raw.text
+    : typeof raw.content === "string" && !raw.content.startsWith("data:") && !raw.content.startsWith("indexeddb://")
+      ? raw.content
+      : "";
+
+  if (rawType === "image" || dataUrl.startsWith("data:image")) {
+    const mimeType = dataUrl.match(/^data:([^;,]+);/)?.[1] || String(raw.mimeType || "image/jpeg");
+    return {
+      id: String(raw.id || `import-image-${Date.now()}-${index}`),
+      type: "image",
+      name: String(raw.name || raw.metadata?.source || `image-${index + 1}.jpg`),
+      mimeType,
+      size: Number(raw.size) || (dataUrl ? dataUrlSize(dataUrl) : 0),
+      dataUrl: dataUrl || undefined,
+      text: typeof raw.text === "string" ? raw.text : undefined,
+    };
+  }
+
+  if (rawType === "file" || text.trim()) {
+    return {
+      id: String(raw.id || `import-file-${Date.now()}-${index}`),
+      type: "file",
+      name: String(raw.name || `file-${index + 1}.txt`),
+      mimeType: String(raw.mimeType || "text/plain"),
+      size: Number(raw.size) || text.length,
+      text,
+    };
+  }
+
+  return null;
+}
+
+function normalizeConversationMessage(raw: any, index: number): ConversationMessage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const text = String(raw.text ?? raw.content ?? "").trim();
+  const attachments = Array.isArray(raw.attachments)
+    ? raw.attachments.map((attachment: any, attachmentIndex: number) => normalizeAttachment(attachment, attachmentIndex)).filter(Boolean)
+    : [];
+  if (!text && attachments.length === 0) return null;
+  const timestamp = raw.createdAt ?? raw.timestamp ?? raw.time;
+  return {
+    id: String(raw.id || `import-message-${Date.now()}-${index}`),
+    role: normalizeRole(raw.role),
+    text,
+    createdAt: toIso(timestamp, Date.now() + index),
+    attachments: attachments.length ? attachments as ConversationMessage["attachments"] : undefined,
+    modelUsed: typeof raw.modelUsed === "string" ? raw.modelUsed : undefined,
+    tokenCount: typeof raw.tokenCount === "number" ? raw.tokenCount : undefined,
+    thoughts: typeof raw.thoughts === "string" ? raw.thoughts : undefined,
+    thoughtsTranslated: typeof raw.thoughtsTranslated === "string" ? raw.thoughtsTranslated : undefined,
+  };
+}
+
+export function normalizeConversationRecord(raw: any, index = 0): ConversationRecord | null {
+  if (!raw || typeof raw !== "object") return null;
+  const messages = Array.isArray(raw.messages)
+    ? raw.messages.map((message: any, messageIndex: number) => normalizeConversationMessage(message, messageIndex)).filter(Boolean)
+    : [];
+  const createdAt = toIso(raw.createdAt ?? raw.startTime, Date.now() + index);
+  const updatedAt = toIso(raw.updatedAt ?? raw.lastModified ?? raw.endTime ?? raw.createdAt, Date.now() + index);
+  const linkedWatchTitle = typeof raw.linkedWatchTitle === "string"
+    ? raw.linkedWatchTitle
+    : typeof raw.watchTitle === "string"
+      ? raw.watchTitle
+      : undefined;
+  const linkedWatchRecordId = typeof raw.linkedWatchRecordId === "string"
+    ? raw.linkedWatchRecordId
+    : typeof raw.watchRecordId === "string"
+      ? raw.watchRecordId
+      : undefined;
+
+  return {
+    id: String(raw.id || `import-session-${Date.now()}-${index}`),
+    title: String(raw.title || raw.name || `导入窗口 ${index + 1}`),
+    createdAt,
+    updatedAt,
+    messages: messages as ConversationRecord["messages"],
+    linkedWatchTitle,
+    linkedWatchRecordId,
+  };
+}
+
+function normalizeConversationList(conversations: ConversationRecord[]): ConversationRecord[] {
+  return conversations
+    .map((conversation, index) => normalizeConversationRecord(conversation, index))
+    .filter(Boolean)
+    .slice(0, MAX_STORED_CONVERSATIONS) as ConversationRecord[];
+}
+
+async function prepareAttachmentForStorage(attachment: NonNullable<ConversationMessage["attachments"]>[number]) {
+  if (attachment.type === "image" && attachment.dataUrl?.startsWith("data:image")) {
+    const id = await imageDB.saveImage(attachment.dataUrl);
+    return {
+      ...attachment,
+      dataUrl: `indexeddb://${id}`,
+    };
+  }
+  return attachment;
+}
+
+async function prepareConversationForStorage(conversation: ConversationRecord): Promise<ConversationRecord> {
+  return {
+    ...conversation,
+    messages: await Promise.all(conversation.messages.map(async (message) => ({
+      ...message,
+      attachments: message.attachments?.length
+        ? await Promise.all(message.attachments.map(prepareAttachmentForStorage))
+        : undefined,
+    }))),
+  };
+}
+
+async function hydrateAttachment(attachment: NonNullable<ConversationMessage["attachments"]>[number]) {
+  if (attachment.type !== "image" || !attachment.dataUrl || !isImageDbRef(attachment.dataUrl)) return attachment;
+  const id = attachment.dataUrl.replace("indexeddb://", "");
+  const dataUrl = await imageDB.getImage(id);
+  return dataUrl ? { ...attachment, dataUrl } : attachment;
+}
+
+async function hydrateConversation(conversation: ConversationRecord): Promise<ConversationRecord> {
+  return {
+    ...conversation,
+    messages: await Promise.all(conversation.messages.map(async (message) => ({
+      ...message,
+      attachments: message.attachments?.length
+        ? await Promise.all(message.attachments.map(hydrateAttachment))
+        : undefined,
+    }))),
+  };
+}
+
+export async function prepareConversationRecordsForStorage(conversations: ConversationRecord[]): Promise<ConversationRecord[]> {
+  const normalized = normalizeConversationList(conversations);
+  return Promise.all(normalized.map(prepareConversationForStorage));
+}
+
+export async function hydrateConversationRecords(conversations: ConversationRecord[]): Promise<ConversationRecord[]> {
+  return Promise.all(normalizeConversationList(conversations).map(hydrateConversation));
+}
+
 function readConversations(): ConversationRecord[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? normalizeConversationList(parsed as ConversationRecord[]) : [];
   } catch {
     return [];
   }
 }
 
 function writeConversations(conversations: ConversationRecord[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations.slice(0, 120)));
+  const normalized = normalizeConversationList(conversations);
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    return;
+  } catch (error) {
+    if (!isQuotaExceeded(error)) throw error;
+  }
+
+  throw new Error("浏览器本地存储空间不足。图片需要先写入 IndexedDB 后再导入，请使用当前版本重新导入；如果仍失败，请先删除部分旧窗口后重试。");
 }
 
 function conversationFingerprint(conversation: ConversationRecord): string {
@@ -77,17 +265,18 @@ export function exportConversationRecords(): ConversationRecord[] {
 
 export function inspectConversationImport(incoming: ConversationRecord[]): ConversationImportInspection {
   const current = readConversations();
+  const normalizedIncoming = normalizeConversationList(incoming);
   const byId = new Map(current.map((conversation) => [conversation.id, conversation]));
   const currentFingerprints = new Set(current.map(conversationFingerprint));
   const inspection: ConversationImportInspection = {
-    total: incoming.length,
+    total: normalizedIncoming.length,
     identical: 0,
     divergentSameId: 0,
     reusableEquivalent: 0,
     newRecords: 0,
   };
 
-  incoming.forEach((conversation) => {
+  normalizedIncoming.forEach((conversation) => {
     const sameId = byId.get(conversation.id);
     const fingerprint = conversationFingerprint(conversation);
     if (sameId) {
@@ -107,6 +296,7 @@ export function importConversationRecords(
   conflictMode: ConversationImportConflictMode = "merge",
 ): ConversationImportReport {
   const current = readConversations();
+  const normalizedIncoming = normalizeConversationList(incoming);
   const next = [...current];
   const report: ConversationImportReport = {
     added: 0,
@@ -116,7 +306,7 @@ export function importConversationRecords(
     idMap: {},
   };
 
-  incoming.forEach((conversation) => {
+  normalizedIncoming.forEach((conversation) => {
     const sameIdIndex = next.findIndex((item) => item.id === conversation.id);
     const fingerprint = conversationFingerprint(conversation);
     if (sameIdIndex >= 0) {
@@ -164,6 +354,14 @@ export function importConversationRecords(
 
   writeConversations(next);
   return report;
+}
+
+export async function importConversationRecordsAsync(
+  incoming: ConversationRecord[],
+  conflictMode: ConversationImportConflictMode = "merge",
+): Promise<ConversationImportReport> {
+  const prepared = await prepareConversationRecordsForStorage(incoming);
+  return importConversationRecords(prepared, conflictMode);
 }
 
 export function getConversation(id: string): ConversationRecord | undefined {

@@ -15,6 +15,7 @@ export interface PersonaCard {
   temperature: number;
   contextDepth: number;
   allowMemory: boolean;
+  allowChronicles: boolean;
 }
 
 export interface PersonaProfile {
@@ -90,6 +91,7 @@ export function createPersonaCard(seed: Partial<PersonaCard> = {}): PersonaCard 
     temperature: normalizeNumber(seed.temperature, 0.75, 0, 2),
     contextDepth: Math.round(normalizeNumber(seed.contextDepth, 0, 0, 100)),
     allowMemory: normalizeBoolean(seed.allowMemory, true),
+    allowChronicles: normalizeBoolean(seed.allowChronicles, true),
   };
 }
 
@@ -146,6 +148,7 @@ function normalizePersonaCard(raw: unknown, fallback?: Partial<PersonaCard>): Pe
     temperature: normalizeNumber(value.temperature, fallback?.temperature ?? 0.75, 0, 2),
     contextDepth: Math.round(normalizeNumber(value.contextDepth, fallback?.contextDepth ?? 0, 0, 100)),
     allowMemory: normalizeBoolean(value.allowMemory, fallback?.allowMemory ?? true),
+    allowChronicles: normalizeBoolean(value.allowChronicles, fallback?.allowChronicles ?? true),
   });
 }
 
@@ -162,6 +165,7 @@ function normalizeLegacyProfile(raw: Record<string, unknown>): PersonaProfile {
     temperature: normalizeNumber(raw.temperature, 0.75, 0, 2),
     contextDepth: Math.round(normalizeNumber(raw.shortTermMessageLimit, 10, 0, 100)),
     allowMemory: normalizeBoolean(raw.allowMemory, true),
+    allowChronicles: normalizeBoolean(raw.allowChronicles, true),
   });
 
   return {

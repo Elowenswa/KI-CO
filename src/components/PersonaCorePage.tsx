@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import {
+  BookOpenText,
   Check,
   Eye,
   EyeOff,
@@ -244,10 +245,10 @@ export function PersonaCorePage({ profile, settings, onChange }: PersonaCorePage
               <CottageStar className="persona-orbit-star persona-orbit-star-left" />
               <CottageStar className="persona-orbit-star persona-orbit-star-right" />
             </div>
-            <div className="persona-bond-name">
+            <label className="persona-bond-name">
               <span>Ta</span>
-              <strong>{activePersona.name || "Persona"}</strong>
-            </div>
+              <input value={activePersona.name} onChange={(event) => updatePersona(activePersona.id, { name: event.target.value })} placeholder="Persona" />
+            </label>
             <div className="persona-avatar-actions compact">
               <label title="上传人格头像">
                 <Upload size={14} />
@@ -264,7 +265,7 @@ export function PersonaCorePage({ profile, settings, onChange }: PersonaCorePage
 
         <div className="persona-memory-status">
           <span />
-          {activePersona.allowMemory ? "记忆已载入 · ACTIVE" : "记忆读取已关闭 · STANDBY"}
+          {activePersona.allowMemory || activePersona.allowChronicles ? "记忆已载入 · ACTIVE" : "记忆读取已关闭 · STANDBY"}
         </div>
 
         <div className="persona-status-actions">
@@ -288,9 +289,14 @@ export function PersonaCorePage({ profile, settings, onChange }: PersonaCorePage
                 <span>PERSONA DECK</span>
                 <strong>人格档案</strong>
               </div>
-              <button type="button" className="persona-add-inline" onClick={addPersona} title="新建人格">
-                NEW
-              </button>
+              <div className="persona-deck-actions">
+                <button type="button" className="persona-add-inline" onClick={addPersona} title="新建人格">
+                  NEW
+                </button>
+                <button type="button" className="persona-delete-inline" onClick={() => deletePersona(activePersona.id)} disabled={profile.personas.length <= 1} title="删除当前人格">
+                  <Trash2 size={12} />
+                </button>
+              </div>
             </div>
             <div className="persona-deck-list">
               {profile.personas.map((persona) => (
@@ -361,8 +367,9 @@ export function PersonaCorePage({ profile, settings, onChange }: PersonaCorePage
                 <MemoryArchiveGlyph size={16} />
                 <span><strong>记忆库</strong><small>{activePersona.allowMemory ? "允许读取" : "停止读取"}</small></span>
               </button>
-              <button type="button" className="persona-danger-button" onClick={() => deletePersona(activePersona.id)} disabled={profile.personas.length <= 1} title="删除当前人格">
-                <Trash2 size={15} />
+              <button type="button" className={`persona-memory-gate ${activePersona.allowChronicles ? "active" : ""}`} onClick={() => updatePersona(activePersona.id, { allowChronicles: !activePersona.allowChronicles })}>
+                <BookOpenText size={16} />
+                <span><strong>时光回廊</strong><small>{activePersona.allowChronicles ? "允许日记召回" : "停止日记召回"}</small></span>
               </button>
             </div>
           </section>

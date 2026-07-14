@@ -1,4 +1,5 @@
 import type {
+  ClaudeCacheTtlMode,
   MemoryRetrievalSettings,
   ModelPreset,
   ModelProvider,
@@ -25,7 +26,7 @@ export const PROVIDER_LABELS: Record<ModelProvider, string> = {
 };
 
 export const PROVIDER_HINTS: Record<ModelProvider, string> = {
-  openrouter: "OpenAI-compatible，适合 OpenRouter 或常见中转站。",
+  openrouter: "OpenAI-compatible，适合常见中转站。",
   claude: "Anthropic Messages API，填写 Claude key。",
   gemini: "Google Gemini API，填写 Gemini key。",
   glm: "智谱 GLM 兼容接口。",
@@ -133,6 +134,8 @@ const DEFAULT_VISUAL_SETTINGS: VisualAtmosphereSettings = {
   customBackgroundDataUrl: "",
   fontStyle: "system",
   fontSize: "standard",
+  markdownNarrativeEnabled: false,
+  emojiFrequency: "off",
   showBilingualLabels: true,
   showStatusStrip: true,
   showButtonLabels: true,
@@ -182,6 +185,9 @@ const DEFAULT_OPENROUTER_EMBEDDING_MODEL = "google/gemini-embedding-2";
 export const DEFAULT_UPLINK_SETTINGS: UplinkSettings = {
   activeProvider: "openrouter",
   journalProvider: "openrouter",
+  claudeCacheTtlMode: "auto",
+  enableReasoning: false,
+  reasoningPreferChinese: false,
   temperature: 0.72,
   stream: true,
   profiles: DEFAULT_PROFILES,
@@ -233,6 +239,14 @@ function normalizeBackgroundFit(value: unknown): VisualAtmosphereSettings["backg
 
 function normalizeTimeAwarenessMode(value: unknown): UplinkSettings["contextLoad"]["timeAwarenessMode"] {
   return value === "off" || value === "realtime" ? value : "date_only";
+}
+
+function normalizeClaudeCacheTtlMode(value: unknown): ClaudeCacheTtlMode {
+  return value === "5m" || value === "1h" ? value : "auto";
+}
+
+function normalizeEmojiFrequency(value: unknown): VisualAtmosphereSettings["emojiFrequency"] {
+  return value === "low" || value === "medium" || value === "high" ? value : "off";
 }
 
 function shouldMigrateLegacyCoverBackground(): boolean {
@@ -363,8 +377,11 @@ export function normalizeUplinkSettings(raw: Partial<UplinkSettings> | null | un
     ...DEFAULT_UPLINK_SETTINGS,
     ...(raw || {}),
     stream: typeof raw?.stream === "boolean" ? raw.stream : true,
+    enableReasoning: typeof (raw as any)?.enableReasoning === "boolean" ? !!(raw as any).enableReasoning : false,
+    reasoningPreferChinese: typeof (raw as any)?.reasoningPreferChinese === "boolean" ? !!(raw as any).reasoningPreferChinese : false,
     activeProvider,
     journalProvider: normalizeJournalProvider((raw as any)?.journalProvider),
+    claudeCacheTtlMode: normalizeClaudeCacheTtlMode((raw as any)?.claudeCacheTtlMode),
     profiles: {
       openrouter: normalizeProfile("openrouter", raw?.profiles?.openrouter),
       claude: normalizeProfile("claude", raw?.profiles?.claude),
@@ -388,6 +405,10 @@ export function normalizeUplinkSettings(raw: Partial<UplinkSettings> | null | un
       backgroundFit: normalizeBackgroundFit(rawVisual?.backgroundFit),
       fontStyle: normalizeFontStyle(rawVisual?.fontStyle),
       fontSize: normalizeFontSize(rawVisual?.fontSize),
+      markdownNarrativeEnabled: typeof rawVisual?.markdownNarrativeEnabled === "boolean"
+        ? rawVisual.markdownNarrativeEnabled
+        : DEFAULT_VISUAL_SETTINGS.markdownNarrativeEnabled,
+      emojiFrequency: normalizeEmojiFrequency(rawVisual?.emojiFrequency),
     },
   };
   return applyAutomaticVectorProfile(normalized);
