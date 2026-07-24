@@ -1,5 +1,6 @@
 import type { ConversationRecord, ModelProvider, UplinkSettings, WatchRecord } from "../types";
 import { normalizeUplinkSettings } from "../settings/uplinkSettings";
+import { preserveLocalSecretsForImportedSettings } from "../settings/apiKeyRing";
 import {
   exportConversationRecords,
   hydrateConversationRecords,
@@ -25,10 +26,10 @@ import {
   getChroniclePreferences,
   getContinuityLine,
   importChronicles,
+  importMemorySeeds,
   listMemorySeeds,
   saveChroniclePreferences,
   saveContinuityLine,
-  saveMemorySeeds,
   type ChronicleEntry,
   type ChroniclePreferences,
   type ContinuityLine,
@@ -252,17 +253,6 @@ function safeSettings(settings: UplinkSettings): UplinkSettings {
     safe.memoryRetrieval.vectorOpenAIApiKey = "";
   }
   return safe;
-}
-
-function keepLocalKeys(imported: UplinkSettings, current: UplinkSettings): UplinkSettings {
-  const next = cloneValue(imported);
-  (Object.keys(next.profiles) as ModelProvider[]).forEach((provider) => {
-    next.profiles[provider].apiKey = current.profiles[provider]?.apiKey || "";
-  });
-  if (next.memoryRetrieval && current.memoryRetrieval) {
-    next.memoryRetrieval.vectorOpenAIApiKey = current.memoryRetrieval.vectorOpenAIApiKey || "";
-  }
-  return next;
 }
 
 function getDeviceTimezone(): string {
@@ -512,7 +502,7 @@ function normalizeLegacySettings(config: Record<string, any>, currentSettings: U
     next.visual.emojiFrequency = "off";
   }
 
-  return keepLocalKeys(normalizeUplinkSettings(next), currentSettings);
+  return preserveLocalSecretsForImportedSettings(normalizeUplinkSettings(next), currentSettings);
 }
 
 function normalizeLegacyMemorySeeds(seeds: unknown): MemorySeed[] {
@@ -801,7 +791,7 @@ function importLegacyBackup(
   if (continuityLine) saveContinuityLine(continuityLine);
 
   const memorySeeds = normalizeLegacyMemorySeeds(continuity.memorySeeds);
-  if (memorySeeds.length) saveMemorySeeds(memorySeeds);
+  const memorySeedReport = importMemorySeeds(memorySeeds);
 
   return conversationReportPromise.then((conversationReport) => {
     const sessionContinuityReport = importSessionContinuity(
@@ -824,7 +814,7 @@ function importLegacyBackup(
         `记忆库：新增 ${memoryReport.added} 条，合并 ${memoryReport.merged} 条。`,
         `时光回廊：新增 ${chronicleReport.added} 篇，合并 ${chronicleReport.merged} 篇。`,
         `窗口接续：恢复状态卡 ${sessionContinuityReport.cards} 张，接续便签 ${sessionContinuityReport.handoffs} 条。`,
-        `生活线：${continuityLine ? "已恢复" : "未发现可恢复内容"}；回忆种子：${memorySeeds.length} 条。`,
+        `生活线：${continuityLine ? "已恢复" : "未发现可恢复内容"}；回忆种子：新增 ${memorySeedReport.added} 条，合并 ${memorySeedReport.merged} 条。`,
         `向量索引：vectors ${vectorReport.indexCount} 条，Obsidian ${vectorReport.obsidianDocCount} 条。`,
         "API Key 不随备份传输；当前设备已填写的 Key 会继续保留。",
       ].join("\n"),
@@ -841,7 +831,10 @@ export async function importBackup(
   if (isLegacyFullBackup(payload)) {
     return importLegacyBackup(payload, currentSettings, conflictMode);
   }
-  const importedSettings = keepLocalKeys(normalizeUplinkSettings(payload.settings), currentSettings);
+  const importedSettings = preserveLocalSecretsForImportedSettings(
+    normalizeUplinkSettings(payload.settings),
+    currentSettings,
+  );
   const personaProfile = normalizePersonaProfile(payload.personaProfile);
 
   if (payload.meta.schema === SETTINGS_SCHEMA) {
@@ -865,7 +858,7 @@ export async function importBackup(
   );
   const memoryReport = importMemoryJson(JSON.stringify(Array.isArray(fullPayload.memories) ? fullPayload.memories : []));
   const chronicleReport = importChronicles(Array.isArray(fullPayload.chronicles) ? fullPayload.chronicles : []);
-  if (Array.isArray(fullPayload.memorySeeds)) saveMemorySeeds(fullPayload.memorySeeds);
+  const memorySeedReport = importMemorySeeds(Array.isArray(fullPayload.memorySeeds) ? fullPayload.memorySeeds : []);
   if (fullPayload.chroniclePreferences) saveChroniclePreferences(fullPayload.chroniclePreferences);
   if (fullPayload.continuityLine) saveContinuityLine(fullPayload.continuityLine);
   const sessionContinuityReport = fullPayload.sessionContinuity
@@ -888,6 +881,7 @@ export async function importBackup(
       `对话：新增 ${conversationReport.added} 条，合并 ${conversationReport.merged} 条，副本 ${conversationReport.copied} 条，复用相同 ${conversationReport.reusedIdentical} 条。`,
       `记忆库：新增 ${memoryReport.added} 条，合并 ${memoryReport.merged} 条。`,
       `时光回廊：新增 ${chronicleReport.added} 篇，合并 ${chronicleReport.merged} 篇。`,
+      `回忆种子：新增 ${memorySeedReport.added} 条，合并 ${memorySeedReport.merged} 条，跳过重复 ${memorySeedReport.skipped} 条。`,
       `窗口接续：恢复状态卡 ${sessionContinuityReport.cards} 张，接续便签 ${sessionContinuityReport.handoffs} 条。`,
       `片单：新增 ${watchReport.added} 条，更新 ${watchReport.merged} 条。`,
       `向量索引：vectors ${vectorReport.indexCount} 条，Obsidian ${vectorReport.obsidianDocCount} 条。`,

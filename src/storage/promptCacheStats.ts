@@ -60,21 +60,32 @@ export function parseUsageForPromptCache(
 ): { inputTokens: number; cachedTokens: number; outputTokens: number } | null {
   if (!usage || typeof usage !== "object") return null;
 
+  const promptTokenTotal = firstFiniteNumber(
+    usage.prompt_tokens,
+    usage.promptTokenCount,
+    usage.prompt_token_count,
+    firstFiniteNumber(usage.prompt_cache_hit_tokens) + firstFiniteNumber(usage.prompt_cache_miss_tokens),
+  );
+  const nativeInputTokens = firstFiniteNumber(usage.input_tokens);
+  const cacheCreationTokens = firstFiniteNumber(
+    usage.cache_creation_input_tokens,
+    usage.cache_creation_tokens,
+  );
+  const cacheReadTokens = firstFiniteNumber(
+    usage.cache_read_input_tokens,
+    usage.cache_read_tokens,
+  );
   const anthropicInputTokens =
-    firstFiniteNumber(usage.input_tokens) +
-    firstFiniteNumber(usage.cache_creation_input_tokens, usage.cache_creation_tokens) +
-    firstFiniteNumber(usage.cache_read_input_tokens, usage.cache_read_tokens);
+    nativeInputTokens + cacheCreationTokens + cacheReadTokens;
+  const hasAnthropicInputBreakdown = cacheCreationTokens > 0 || cacheReadTokens > 0;
 
   const inputTokens = Math.max(
     0,
     Math.round(
       firstFiniteNumber(
-        anthropicInputTokens > 0 ? anthropicInputTokens : undefined,
-        usage.prompt_tokens,
-        usage.input_tokens,
-        usage.promptTokenCount,
-        usage.prompt_token_count,
-        firstFiniteNumber(usage.prompt_cache_hit_tokens) + firstFiniteNumber(usage.prompt_cache_miss_tokens),
+        promptTokenTotal > 0 ? promptTokenTotal : undefined,
+        hasAnthropicInputBreakdown && anthropicInputTokens > 0 ? anthropicInputTokens : undefined,
+        nativeInputTokens,
       ),
     ),
   );

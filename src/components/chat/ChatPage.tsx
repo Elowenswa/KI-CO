@@ -30,6 +30,7 @@ import type {
   ConversationMessage,
   ConversationRecord,
   MemorySnippet,
+  TimeBridgeMeta,
   UplinkSettings,
 } from "../../types";
 import type { AvatarPosition, PersonaProfile } from "../../storage/personaProfile";
@@ -49,9 +50,19 @@ import { selectCacheFriendlyWindow } from "../../utils/contextWindow";
 import { shouldRetrieveMemory } from "../../utils/memoryRecallGate";
 import { recordContextRetrievalAction, recordContextRetrievalResult, recordContextRetrievalSkip, retrieveMemorySnippetsDetailed, type ContextRetrievalMeta } from "../../storage/memoryBank";
 import {
+  applyTopicRecallJudgement,
+  buildMemoryRetrievalQuery,
   commitTopicMemorySet,
+  evaluateTopicJudgeEligibility,
   evaluateTopicGate,
+  getTopicJudgeThrottleState,
   getTopicMemorySet,
+  getTopicMemorySets,
+  inspectTopicMemorySetRestore,
+  recordTopicJudgeUse,
+  resetTopicJudgeThrottle,
+  selectFreshSupplementRows,
+  shouldAllowTopicJudge,
   topicMemorySetHash,
   type TopicGateResult,
   type TopicMemorySet,
@@ -59,6 +70,7 @@ import {
 import { buildTimeAwarenessContext, buildTimeBridgeMeta } from "../../utils/timeAwareness";
 import { MarkdownText } from "../MarkdownText";
 import { getChronicleWriteIntent, getContinuityContext, maybeWriteChronicleAfterTurn } from "../../services/chronicleService";
+import { judgeTopicRecallWithJournalModel } from "../../services/topicRecallJudge";
 import { getChroniclePreferences, getContinuityLine } from "../../storage/chronicles";
 import {
   captureWindowHandoff,
@@ -121,8 +133,17 @@ interface ChatPageProps {
   onClose?: () => void;
 }
 
+interface GenerationContextSnapshot {
+  personaCore: string;
+  assembledUserContext: string;
+  dynamicContext: string;
+  memories: MemorySnippet[];
+  timeBridgeMeta: TimeBridgeMeta;
+}
+
 const COMPOSER_LINE_HEIGHT = 20;
 const COMPOSER_MAX_LINES = 3;
+const STREAM_PERSIST_INTERVAL_MS = 2500;
 const MAX_ATTACHMENTS = 4;
 const MAX_FILE_SIZE_MB = 3;
 const INITIAL_VISIBLE_MESSAGE_COUNT = 50;
@@ -558,6 +579,7 @@ export function ChatPage({
   const previousActiveIdRef = useRef(activeId);
   const shouldAutoFollowScrollRef = useRef(true);
   const programmaticScrollUntilRef = useRef(0);
+  const generationContextSnapshotsRef = useRef(new Map<string, GenerationContextSnapshot>());
 
   const activeConversation = useMemo(
     () => conversations.find((conversation) => conversation.id === activeId) || getConversation(activeId),
@@ -1220,7 +1242,11 @@ export function ChatPage({
     onMetaUpdate?: (meta: { thoughts?: string; thoughtsTranslated?: string }) => void,
     signal?: AbortSignal,
     timeBridgeNow?: Date,
+    generationContext?: { key: string; reuse?: boolean },
   ) {
+    const replaySnapshot = generationContext?.reuse
+      ? generationContextSnapshotsRef.current.get(generationContext.key)
+      : undefined;
     const chroniclePreferences = getChroniclePreferences();
     const personaAllowsMemory = activePersona?.allowMemory !== false;
     const personaAllowsChronicles = activePersona?.allowChronicles !== false;
@@ -1234,33 +1260,226 @@ export function ChatPage({
           ? "memory_recall_gate_skipped"
           : "";
 
-    const [personaCore, userContext] = await Promise.all([
-      adapters.persona.getPersonaCore(),
-      adapters.persona.getUserContext?.() ?? Promise.resolve(""),
-    ]);
+    const [personaCore, userContext] = replaySnapshot
+      ? [replaySnapshot.personaCore, ""]
+      : await Promise.all([
+          adapters.persona.getPersonaCore(),
+          adapters.persona.getUserContext?.() ?? Promise.resolve(""),
+        ]);
     const topicScope = activeConversation ? `chat:${activeConversation.id}` : "chat:draft";
-    let memories: MemorySnippet[] = [];
-    if (memorySkipReason && memorySkipReason !== "memory_recall_gate_skipped") {
+    let memories: MemorySnippet[] = replaySnapshot
+      ? replaySnapshot.memories.map((memory) => ({ ...memory }))
+      : [];
+    if (replaySnapshot) {
+      if (memories.length) {
+        recordContextRetrievalAction(
+          userText,
+          memories,
+          "regeneration_context_replay",
+          uplinkSettings,
+          {
+            finalTopicDecisionSource: "regenerationReplay",
+            topicMemoryHashChangedBecause: "regeneration_context_replay",
+            reusedMemoryCount: memories.length,
+          },
+        );
+      } else {
+        recordContextRetrievalSkip(
+          userText,
+          "regeneration_context_replay_without_memory",
+          uplinkSettings,
+          {
+            finalTopicDecisionSource: "regenerationReplay",
+            topicMemoryHashChangedBecause: "regeneration_context_replay",
+          },
+        );
+      }
+    } else if (memorySkipReason && memorySkipReason !== "memory_recall_gate_skipped") {
       recordContextRetrievalSkip(userText, memorySkipReason, uplinkSettings);
     } else {
-      const gate = evaluateTopicGate(topicScope, userText, {
+      let existingSet = getTopicMemorySet(topicScope);
+      let gate = evaluateTopicGate(topicScope, userText, {
         recallGatePassed,
         hasAttachments: attachments.length > 0,
-      });
-      const existingSet = getTopicMemorySet(topicScope);
+      }, existingSet);
+      const topicSetsForScope = getTopicMemorySets(topicScope);
+      let topicSetRestoreDebug: ContextRetrievalMeta = {
+        topicMemorySetRestored: false,
+        restoredTopicMemorySetId: "",
+        topicMemorySetRestoreReason: "",
+        topicMemorySetRestoreScore: 0,
+        topicMemorySetRestoreCurrentScore: 0,
+        topicMemorySetRestoreMatchedTokens: [],
+        topicMemorySetRestoreCurrentMatchedTokens: [],
+        topicMemorySetRestoreCoveredByCurrent: false,
+        topicMemorySetRestoreCandidateCount: Math.max(0, topicSetsForScope.length - 1),
+        topicMemorySetRecentCount: topicSetsForScope.length,
+      };
+      const topicSetRestoreInspection = gate.ragAction !== "none"
+        ? inspectTopicMemorySetRestore(userText, topicSetsForScope.slice(1), existingSet)
+        : undefined;
+      if (topicSetRestoreInspection) {
+        topicSetRestoreDebug = {
+          ...topicSetRestoreDebug,
+          topicMemorySetRestoreReason: topicSetRestoreInspection.reason,
+          topicMemorySetRestoreScore: topicSetRestoreInspection.bestScore,
+          topicMemorySetRestoreCurrentScore: topicSetRestoreInspection.currentScore,
+          topicMemorySetRestoreMatchedTokens: topicSetRestoreInspection.bestMatchedTokens,
+          topicMemorySetRestoreCurrentMatchedTokens: topicSetRestoreInspection.currentMatchedTokens,
+          topicMemorySetRestoreCoveredByCurrent: topicSetRestoreInspection.coveredByCurrentSet,
+          topicMemorySetRestoreCandidateCount: topicSetRestoreInspection.candidateCount,
+        };
+      }
+      const restorableTopicSet = topicSetRestoreInspection?.result;
+      if (restorableTopicSet) {
+        existingSet = restorableTopicSet.set;
+        const restoredGate = evaluateTopicGate(topicScope, userText, {
+          recallGatePassed,
+          hasAttachments: attachments.length > 0,
+        }, existingSet);
+        const restoredAction = restoredGate.ragAction === "refresh"
+          ? "reuse"
+          : (restoredGate.ragAction || restoredGate.decision);
+        gate = {
+          ...restoredGate,
+          decision: restoredAction === "supplement" ? "supplement" : "reuse",
+          ragAction: restoredAction === "supplement" ? "supplement" : "reuse",
+          relation: restoredAction === "supplement" ? "related" : "same",
+          reason: `restored_topic_memory_set:${restorableTopicSet.reason}`,
+          confidence: "high",
+          matchedRules: Array.from(new Set([...restoredGate.matchedRules, "restored_topic_memory_set"])),
+          winningRule: "restored_topic_memory_set",
+          topicFingerprint: existingSet.topicFingerprint,
+          noRagReason: "",
+          reuseReason: restoredAction === "supplement" ? "" : `restored_topic_memory_set:${restorableTopicSet.reason}`,
+          supplementReason: restoredAction === "supplement" ? `restored_topic_memory_set:${restorableTopicSet.reason}` : "",
+          refreshReason: "",
+        };
+        topicSetRestoreDebug = {
+          ...topicSetRestoreDebug,
+          topicMemorySetRestored: true,
+          restoredTopicMemorySetId: restorableTopicSet.set.id,
+          topicMemorySetRestoreReason: restorableTopicSet.reason,
+          topicMemorySetRestoreScore: restorableTopicSet.score,
+          topicMemorySetRestoreCurrentScore: restorableTopicSet.currentScore,
+          topicMemorySetRestoreMatchedTokens: restorableTopicSet.matchedTokens,
+        };
+      }
+      const originalGate = gate;
+      const topicJudgeTurnIndex = baseMessages.length + 1;
+      const topicJudgeEligibility = evaluateTopicJudgeEligibility(
+        userText,
+        gate,
+        !!existingSet?.snippets.length,
+      );
+      const topicJudgeThrottle = shouldAllowTopicJudge(topicScope, topicJudgeTurnIndex);
+      let topicJudgeDebug: ContextRetrievalMeta = {
+        topicJudgeUsed: false,
+        topicJudgeDecision: "",
+        topicJudgeNeedsRecall: null,
+        topicJudgeConfidence: "",
+        topicJudgeReason: "",
+        topicJudgeEligibilityReason: topicJudgeEligibility.reason,
+        topicJudgeRecallSignal: topicJudgeEligibility.fallbackRecallSignal,
+        topicJudgeError: "",
+        topicJudgeSkippedReason: "",
+        topicJudgeConsecutiveTurns: 0,
+        topicJudgeCooldownUntilTurn: 0,
+        modelFallbackUsed: false,
+        modelFallbackSkipReason: "",
+        modelFallbackCallsInWindow: 0,
+        modelFallbackConsecutiveCount: 0,
+        modelFallbackCooldownRemaining: 0,
+        finalTopicDecisionSource: "local",
+        topicGateOriginalDecision: originalGate.decision,
+        topicGateOriginalReason: originalGate.reason,
+        topicGateOriginalWinningRule: originalGate.winningRule,
+      };
+
+      if (!topicJudgeEligibility.shouldJudge) {
+        resetTopicJudgeThrottle(topicScope);
+      } else if (!topicJudgeThrottle.allowed) {
+        gate = applyTopicRecallJudgement(gate, {
+          topicRelation: "unknown",
+          needsRecall: null,
+          confidence: "low",
+          reason: topicJudgeThrottle.reason,
+        }, {
+          hasExistingTopicSet: !!existingSet?.snippets.length,
+          fallbackRecallSignal: topicJudgeEligibility.fallbackRecallSignal,
+        });
+        const state = getTopicJudgeThrottleState(topicScope);
+        topicJudgeDebug = {
+          ...topicJudgeDebug,
+          topicJudgeSkippedReason: topicJudgeThrottle.reason,
+          topicJudgeConsecutiveTurns: state.consecutiveTurns,
+          topicJudgeCooldownUntilTurn: state.cooldownUntilTurn,
+          modelFallbackSkipReason: topicJudgeThrottle.reason,
+          modelFallbackCallsInWindow: state.callsInWindow,
+          modelFallbackConsecutiveCount: state.consecutiveTurns,
+          modelFallbackCooldownRemaining: Math.max(0, state.cooldownUntilTurn - topicJudgeTurnIndex),
+          finalTopicDecisionSource: "fallbackBudgetLimit",
+        };
+      } else {
+        recordTopicJudgeUse(topicScope, topicJudgeTurnIndex);
+        const state = getTopicJudgeThrottleState(topicScope);
+        const previousAssistant = [...baseMessages]
+          .reverse()
+          .find((message) => message.role === "companion" && message.text.trim());
+        const judgement = await judgeTopicRecallWithJournalModel(adapters.llm, {
+          cacheScope: topicScope,
+          userMessage: userText,
+          previousAssistantText: previousAssistant?.text || "",
+          topicFingerprint: existingSet?.topicFingerprint || gate.topicFingerprint,
+          memoryTitles: (existingSet?.snippets || []).map((snippet) => snippet.title).filter(Boolean),
+          localGateReason: gate.reason,
+        });
+        const judgementUsable = (
+          judgement.topicRelation !== "unknown"
+          && judgement.needsRecall !== null
+          && judgement.confidence !== "low"
+        );
+        gate = applyTopicRecallJudgement(gate, judgement, {
+          hasExistingTopicSet: !!existingSet?.snippets.length,
+          fallbackRecallSignal: topicJudgeEligibility.fallbackRecallSignal,
+        });
+        topicJudgeDebug = {
+          ...topicJudgeDebug,
+          topicJudgeUsed: true,
+          topicJudgeDecision: judgement.topicRelation,
+          topicJudgeNeedsRecall: judgement.needsRecall,
+          topicJudgeConfidence: judgement.confidence,
+          topicJudgeReason: judgement.reason,
+          topicJudgeError: judgementUsable ? "" : judgement.reason,
+          topicJudgeConsecutiveTurns: state.consecutiveTurns,
+          topicJudgeCooldownUntilTurn: state.cooldownUntilTurn,
+          modelFallbackUsed: true,
+          modelFallbackSkipReason: judgementUsable
+            ? ""
+            : judgement.topicRelation === "unknown" || judgement.needsRecall === null
+              ? "model_unknown"
+              : "model_low_confidence",
+          modelFallbackCallsInWindow: state.callsInWindow,
+          modelFallbackConsecutiveCount: state.consecutiveTurns,
+          modelFallbackCooldownRemaining: Math.max(0, state.cooldownUntilTurn - topicJudgeTurnIndex),
+          finalTopicDecisionSource: judgementUsable ? "modelFallback" : "modelFallbackConservative",
+        };
+      }
 
       if (gate.ragAction === "none") {
-        const set = commitTopicMemorySet(topicScope, userText, [], gate);
+        const set = commitTopicMemorySet(topicScope, userText, [], gate, existingSet);
         recordContextRetrievalSkip(
           userText,
           `topic_gate_rag_action_none:${gate.noRagReason || gate.reason}`,
           uplinkSettings,
           topicDebugMeta(gate, set, {
+            ...topicSetRestoreDebug,
+            ...topicJudgeDebug,
             topicMemoryHashChangedBecause: "memory_action_none",
           }),
         );
       } else if (gate.ragAction === "reuse" && existingSet?.snippets.length) {
-        const set = commitTopicMemorySet(topicScope, userText, existingSet.snippets, gate) || existingSet;
+        const set = commitTopicMemorySet(topicScope, userText, existingSet.snippets, gate, existingSet) || existingSet;
         memories = set.snippets;
         recordContextRetrievalAction(
           userText,
@@ -1268,25 +1487,47 @@ export function ChatPage({
           `topic_gate_reuse:${gate.reuseReason || gate.reason}`,
           uplinkSettings,
           topicDebugMeta(gate, set, {
+            ...topicSetRestoreDebug,
+            ...topicJudgeDebug,
             topicMemoryHashChangedBecause: gate.supplementSkippedReason ? "supplement_throttled_reuse" : "",
           }),
         );
       } else {
+        const shouldPreferAnchorQuery = gate.matchedRules.some((rule) => [
+          "specific_memory_request",
+          "vague_memory_request",
+          "historical_memory_cue",
+          "direct_memory_anchor",
+          "archive_intent_recall",
+          "journal_needs_recall",
+        ].includes(rule));
+        const memoryRetrievalQuery = shouldPreferAnchorQuery
+          ? buildMemoryRetrievalQuery(userText)
+          : userText;
         const retrievalLimit = gate.ragAction === "supplement"
-          ? Math.min(2, uplinkSettings.contextLoad.memorySnippetLimit)
+          ? Math.max(8, uplinkSettings.contextLoad.memorySnippetLimit * 3)
           : uplinkSettings.contextLoad.memorySnippetLimit;
-        const result = await retrieveMemorySnippetsDetailed(userText, retrievalLimit, uplinkSettings);
-        const retrieved = filterPersonaMemories(result.snippets, personaAllowsMemory, personaAllowsChronicles);
-        const beforeMemoryCount = existingSet?.memoryIds.length || 0;
-        const set = commitTopicMemorySet(topicScope, userText, retrieved, gate);
+        const result = await retrieveMemorySnippetsDetailed(memoryRetrievalQuery, retrievalLimit, uplinkSettings);
+        const eligible = filterPersonaMemories(result.snippets, personaAllowsMemory, personaAllowsChronicles);
+        const retrieved = gate.ragAction === "supplement"
+          ? selectFreshSupplementRows(eligible, existingSet?.memoryIds || [], 2)
+          : eligible;
+        const set = commitTopicMemorySet(topicScope, userText, retrieved, gate, existingSet);
         memories = set?.snippets || retrieved;
-        const mergedNewCount = Math.max(0, (set?.memoryIds.length || 0) - beforeMemoryCount);
+        const previousMemoryIds = new Set(existingSet?.memoryIds || []);
+        const mergedNewCount = (set?.memoryIds || []).filter((id) => !previousMemoryIds.has(id)).length;
+        const supplementSkippedReason = gate.ragAction === "supplement" && eligible.length > 0 && retrieved.length === 0
+          ? "duplicate_candidates"
+          : "";
         recordContextRetrievalResult(
           result,
           uplinkSettings,
           topicDebugMeta(gate, set, {
-            supplementCandidateCount: gate.ragAction === "supplement" ? retrieved.length : 0,
+            ...topicSetRestoreDebug,
+            ...topicJudgeDebug,
+            supplementCandidateCount: gate.ragAction === "supplement" ? eligible.length : 0,
             supplementMergedNewCount: gate.ragAction === "supplement" ? mergedNewCount : 0,
+            supplementSkippedReason,
             topicMemoryHashChangedBecause: gate.ragAction === "supplement"
               ? (mergedNewCount > 0 ? "supplement_new_rows" : "supplement_no_new_rows")
               : gate.ragAction === "refresh"
@@ -1318,8 +1559,11 @@ ${currentStateCard.content.trim()}`
     const handoffContext = handoff?.content.trim()
       ? `这是上一窗口刚刚聊到的位置，只在这次接续时参考：\n${handoff.content}`
       : "";
-    const assembledUserContext = [userContext, continuityContext, stateCardContext, handoffContext].filter(Boolean).join("\n\n");
-    const filteredMemories = filterPersonaMemories(memories, personaAllowsMemory, personaAllowsChronicles);
+    const assembledUserContext = replaySnapshot?.assembledUserContext
+      ?? [userContext, continuityContext, stateCardContext, handoffContext].filter(Boolean).join("\n\n");
+    const filteredMemories = replaySnapshot
+      ? replaySnapshot.memories.map((memory) => ({ ...memory }))
+      : filterPersonaMemories(memories, personaAllowsMemory, personaAllowsChronicles);
     const timeBridgeOptions = {
       messages: baseMessages,
       stateCard: currentStateCard,
@@ -1328,8 +1572,11 @@ ${currentStateCard.content.trim()}`
       memoryRecallEnabled: chroniclePreferences.enableMemoryRecall && personaAllowsMemory,
       chronicleRecallEnabled: chroniclePreferences.enableMemoryRecall && personaAllowsChronicles,
     };
-    const dynamicContext = buildTimeAwarenessContext(uplinkSettings, timeBridgeOptions, timeBridgeNow || new Date());
-    const timeBridgeMeta = buildTimeBridgeMeta(timeBridgeOptions);
+    const dynamicContext = replaySnapshot?.dynamicContext
+      ?? buildTimeAwarenessContext(uplinkSettings, timeBridgeOptions, timeBridgeNow || new Date());
+    const timeBridgeMeta = replaySnapshot?.timeBridgeMeta
+      ? { ...replaySnapshot.timeBridgeMeta }
+      : buildTimeBridgeMeta(timeBridgeOptions);
 
     const recentMessages = selectCacheFriendlyWindow(baseMessages, uplinkSettings.contextLoad.shortTermMessageLimit)
       .map((message) => ({
@@ -1338,7 +1585,7 @@ ${currentStateCard.content.trim()}`
         attachments: message.attachments,
       }));
 
-    return adapters.llm.complete({
+    const response = await adapters.llm.complete({
       mode: "chat",
       cacheScope: activeConversation ? `chat:${activeConversation.id}` : "chat:draft",
       userMessage: userText,
@@ -1358,6 +1605,20 @@ ${currentStateCard.content.trim()}`
       signal,
       watch: createEmptyWatchContext(),
     });
+    if (generationContext?.key && !replaySnapshot) {
+      generationContextSnapshotsRef.current.set(generationContext.key, {
+        personaCore,
+        assembledUserContext,
+        dynamicContext,
+        memories: filteredMemories.map((memory) => ({ ...memory })),
+        timeBridgeMeta: { ...timeBridgeMeta },
+      });
+      if (generationContextSnapshotsRef.current.size > 64) {
+        const oldestKey = generationContextSnapshotsRef.current.keys().next().value;
+        if (oldestKey) generationContextSnapshotsRef.current.delete(oldestKey);
+      }
+    }
+    return response;
   }
 
   async function submitUserMessage(
@@ -1367,6 +1628,7 @@ ${currentStateCard.content.trim()}`
     restoreDraftOnError = false,
     reuseUserMessage?: ConversationMessage,
     contextNow?: Date,
+    reuseGenerationContext = false,
   ) {
     const text = rawText.trim();
     const attachments = cloneAttachments(rawAttachments);
@@ -1400,7 +1662,9 @@ ${currentStateCard.content.trim()}`
       id: `companion-${Date.now()}`,
       role: "companion",
       text: "",
-      createdAt: new Date().toISOString(),
+      createdAt: reuseGenerationContext && contextNow && !Number.isNaN(contextNow.getTime())
+        ? contextNow.toISOString()
+        : new Date().toISOString(),
     };
     const conversationId = activeConversation.id;
     const baseMessages = [...historyPrefix, userMessage];
@@ -1411,23 +1675,68 @@ ${currentStateCard.content.trim()}`
     let latestStreamedText = "";
     let latestThoughts = "";
     let latestThoughtsTranslated = "";
+    let lastStreamPersistAt = 0;
+    let streamPersistTimer: number | null = null;
+    let streamPersistenceFinalized = false;
     const abortController = new AbortController();
     abortControllerRef.current?.abort();
     abortControllerRef.current = abortController;
+    const buildCompanionSnapshot = (text: string, modelUsed?: string): ConversationMessage => ({
+      ...companionMessage,
+      text,
+      modelUsed: modelUsed || uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
+      tokenCount: estimateMessageTokens({ text }),
+      thoughts: latestThoughts || undefined,
+      thoughtsTranslated: latestThoughtsTranslated || undefined,
+    });
+    const persistStreamSnapshot = (text: string, force = false) => {
+      if (streamPersistenceFinalized) return;
+      const trimmed = text.trim();
+      if (!trimmed) return;
+
+      const write = () => {
+        if (streamPersistenceFinalized) return;
+        lastStreamPersistAt = Date.now();
+        replaceConversationMessages(conversationId, [
+          ...baseMessages,
+          buildCompanionSnapshot(trimmed),
+        ]);
+      };
+
+      if (force) {
+        if (streamPersistTimer !== null) {
+          window.clearTimeout(streamPersistTimer);
+          streamPersistTimer = null;
+        }
+        write();
+        return;
+      }
+
+      const delay = Math.max(0, STREAM_PERSIST_INTERVAL_MS - (Date.now() - lastStreamPersistAt));
+      if (delay === 0) {
+        write();
+      } else if (streamPersistTimer === null) {
+        streamPersistTimer = window.setTimeout(() => {
+          streamPersistTimer = null;
+          write();
+        }, delay);
+      }
+    };
+    const finishStreamPersistence = () => {
+      streamPersistenceFinalized = true;
+      if (streamPersistTimer !== null) {
+        window.clearTimeout(streamPersistTimer);
+        streamPersistTimer = null;
+      }
+    };
     const handleMetaUpdate = (meta: { thoughts?: string; thoughtsTranslated?: string }) => {
       if (typeof meta.thoughts === "string") latestThoughts = meta.thoughts;
       if (typeof meta.thoughtsTranslated === "string") latestThoughtsTranslated = meta.thoughtsTranslated;
       scheduleStreamPreview(conversationId, [
         ...baseMessages,
-        {
-          ...companionMessage,
-          text: latestStreamedText,
-          modelUsed: uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
-          tokenCount: estimateMessageTokens({ text: latestStreamedText }),
-          thoughts: latestThoughts || undefined,
-          thoughtsTranslated: latestThoughtsTranslated || undefined,
-        },
+        buildCompanionSnapshot(latestStreamedText),
       ]);
+      persistStreamSnapshot(latestStreamedText);
     };
 
     try {
@@ -1435,28 +1744,23 @@ ${currentStateCard.content.trim()}`
         latestStreamedText = streamedText;
         scheduleStreamPreview(conversationId, [
           ...baseMessages,
-          {
-            ...companionMessage,
-            text: streamedText,
-            modelUsed: uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
-            tokenCount: estimateMessageTokens({ text: streamedText }),
-            thoughts: latestThoughts || undefined,
-            thoughtsTranslated: latestThoughtsTranslated || undefined,
-          },
+          buildCompanionSnapshot(streamedText),
         ]);
-      }, handleMetaUpdate, abortController.signal, contextNow);
+        persistStreamSnapshot(streamedText);
+      }, handleMetaUpdate, abortController.signal, contextNow, {
+        key: `${conversationId}:${userMessage.id}`,
+        reuse: reuseGenerationContext,
+      });
       const completedMessages = [
         ...baseMessages,
         {
-          ...companionMessage,
-          text: response.text,
-          modelUsed: response.modelUsed || uplinkSettings.profiles[uplinkSettings.activeProvider]?.model,
-          tokenCount: estimateMessageTokens({ text: response.text }),
+          ...buildCompanionSnapshot(response.text, response.modelUsed),
           thoughts: response.thoughts || latestThoughts || undefined,
           thoughtsTranslated: response.thoughtsTranslated || latestThoughtsTranslated || undefined,
         },
       ];
       clearPendingStreamPreview();
+      finishStreamPersistence();
       replaceConversationMessages(conversationId, completedMessages);
       refresh(conversationId);
       markWindowHandoffUsed(conversationId);
@@ -1493,6 +1797,7 @@ ${currentStateCard.content.trim()}`
     } catch (event) {
       const aborted = event instanceof DOMException && event.name === "AbortError";
       clearPendingStreamPreview();
+      finishStreamPersistence();
       if (aborted) {
         replaceConversationMessages(conversationId, [
           ...baseMessages,
@@ -1514,7 +1819,13 @@ ${currentStateCard.content.trim()}`
           },
         ]);
       } else {
-        replaceConversationMessages(conversationId, historyPrefix);
+        const errorText = event instanceof Error
+          ? `连接中断：${event.message}`
+          : "连接中断：对话请求失败。";
+        replaceConversationMessages(conversationId, [
+          ...baseMessages,
+          buildCompanionSnapshot(errorText),
+        ]);
       }
       if (restoreDraftOnError && !latestStreamedText.trim()) {
         setInput(rawText);
@@ -1566,6 +1877,7 @@ ${currentStateCard.content.trim()}`
       false,
       previousUser,
       contextNow && !Number.isNaN(contextNow.getTime()) ? contextNow : undefined,
+      true,
     );
   }
 

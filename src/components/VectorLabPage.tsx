@@ -1152,10 +1152,40 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
                         <strong>{latestContextTurn.topicRelation || "-"}</strong>
                         <span>rag action</span>
                         <strong>{latestContextTurn.ragAction || "-"}</strong>
+                        <span>journal judge</span>
+                        <strong>
+                          {latestContextTurn.topicJudgeUsed
+                            ? `${latestContextTurn.topicJudgeDecision || "unknown"} · recall=${latestContextTurn.topicJudgeNeedsRecall === null ? "?" : latestContextTurn.topicJudgeNeedsRecall ? "yes" : "no"} · ${latestContextTurn.topicJudgeConfidence || "-"}`
+                            : `off · ${latestContextTurn.topicJudgeEligibilityReason || "-"}`}
+                        </strong>
+                        <span>judge reason</span>
+                        <strong>{latestContextTurn.topicJudgeReason || latestContextTurn.topicJudgeSkippedReason || "-"}</strong>
+                        <span>decision source</span>
+                        <strong>{latestContextTurn.finalTopicDecisionSource || "local"}</strong>
+                        <span>judge budget</span>
+                        <strong>
+                          {`calls=${latestContextTurn.modelFallbackCallsInWindow ?? 0} / consecutive=${latestContextTurn.modelFallbackConsecutiveCount ?? 0} / cooldown=${latestContextTurn.modelFallbackCooldownRemaining ?? 0}`}
+                        </strong>
                         <span>decision</span>
                         <strong>{latestContextTurn.topicGateDecision || "-"}</strong>
                         <span>set hash</span>
                         <strong>{latestContextTurn.topicMemorySetHash || "-"}</strong>
+                        <span>recent sets</span>
+                        <strong>
+                          {`${latestContextTurn.topicMemorySetRecentCount ?? "-"} / candidates ${latestContextTurn.topicMemorySetRestoreCandidateCount ?? 0}`}
+                        </strong>
+                        <span>restored set</span>
+                        <strong>
+                          {latestContextTurn.topicMemorySetRestored
+                            ? `${latestContextTurn.restoredTopicMemorySetId?.slice(0, 8) || "yes"} · ${latestContextTurn.topicMemorySetRestoreReason || "-"}`
+                            : latestContextTurn.topicMemorySetRestoreCoveredByCurrent
+                              ? `current covers · ${(latestContextTurn.topicMemorySetRestoreCurrentMatchedTokens || []).slice(0, 3).join(", ") || latestContextTurn.topicMemorySetRestoreReason || "-"}`
+                              : "-"}
+                        </strong>
+                        <span>restore score</span>
+                        <strong>
+                          {`${latestContextTurn.topicMemorySetRestoreScore ?? 0} / current ${latestContextTurn.topicMemorySetRestoreCurrentScore ?? 0}`}
+                        </strong>
                         <span>turns / reused</span>
                         <strong>{latestContextTurn.turnsSinceRefresh ?? "-"} / {latestContextTurn.reusedMemoryCount ?? "-"}</strong>
                         <span>reason</span>

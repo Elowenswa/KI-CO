@@ -172,6 +172,7 @@ export interface MemoryAdapter {
 export interface CompanionRequest {
   mode?: "cinema" | "chat" | "plan" | "watchPrompt";
   channel?: "chat" | "journal";
+  purpose?: "topic-recall-judge" | "session-state";
   cacheScope?: string;
   userMessage: string;
   attachments?: ConversationAttachment[];
@@ -188,6 +189,8 @@ export interface CompanionRequest {
   timeBridgeMeta?: TimeBridgeMeta;
   onStreamUpdate?: (text: string) => void;
   onMetaUpdate?: (meta: { thoughts?: string; thoughtsTranslated?: string }) => void;
+  temperatureOverride?: number;
+  maxOutputTokensOverride?: number;
   signal?: AbortSignal;
 }
 

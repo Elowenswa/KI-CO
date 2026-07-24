@@ -13,6 +13,7 @@ import type {
   VisualAtmosphereSettings,
 } from "../types";
 import { JOURNAL_MODEL_PRESETS, MODEL_PRESETS, PROVIDER_HINTS, PROVIDER_LABELS } from "../settings/uplinkSettings";
+import { findRememberedApiKey, rememberApiKeyForEndpoint } from "../settings/apiKeyRing";
 import { createFullBackup, createSettingsBackup, createTravelPack, downloadBackup, importBackup, inspectBackupConversations } from "../storage/fullBackup";
 import type { PersonaProfile } from "../storage/personaProfile";
 import { getChroniclePreferences, saveChroniclePreferences, subscribeChronicles } from "../storage/chronicles";
@@ -272,6 +273,21 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
     updateProviderProfile(provider, patch);
   }
 
+  function updateProviderApiKey(targetProvider: ModelProvider, apiKey: string) {
+    const targetProfile = settings.profiles[targetProvider];
+    rememberApiKeyForEndpoint(targetProvider, targetProfile.baseUrl, apiKey);
+    updateProviderProfile(targetProvider, { apiKey });
+  }
+
+  function updateProviderBaseUrl(targetProvider: ModelProvider, baseUrl: string) {
+    const targetProfile = settings.profiles[targetProvider];
+    rememberApiKeyForEndpoint(targetProvider, targetProfile.baseUrl, targetProfile.apiKey);
+    updateProviderProfile(targetProvider, {
+      baseUrl,
+      apiKey: findRememberedApiKey(targetProvider, baseUrl),
+    });
+  }
+
   function updateJournalProvider(value: JournalProvider) {
     onChange({
       ...settings,
@@ -327,6 +343,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
   }
 
   function switchProvider(nextProvider: ModelProvider) {
+    rememberApiKeyForEndpoint(provider, profile.baseUrl, profile.apiKey);
     onChange({
       ...settings,
       activeProvider: nextProvider,
@@ -587,13 +604,13 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                 type="password"
                 autoComplete="off"
                 placeholder="sk-..."
-                onChange={(event) => updateProfile({ apiKey: event.target.value })}
+                onChange={(event) => updateProviderApiKey(provider, event.target.value)}
               />
             </label>
 
             <label>
               <span>Base URL</span>
-              <input value={profile.baseUrl} placeholder="https://openrouter.ai/api/v1" onChange={(event) => updateProfile({ baseUrl: event.target.value })} />
+              <input value={profile.baseUrl} placeholder="https://openrouter.ai/api/v1" onChange={(event) => updateProviderBaseUrl(provider, event.target.value)} />
             </label>
 
             <label className="model-preset-field">
@@ -725,7 +742,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                       type="password"
                       autoComplete="off"
                       placeholder="sk-..."
-                      onChange={(event) => updateProviderProfile(journalProvider, { apiKey: event.target.value })}
+                      onChange={(event) => updateProviderApiKey(journalProvider, event.target.value)}
                     />
                   </label>
 
@@ -734,7 +751,7 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
                     <input
                       value={journalProfile.baseUrl}
                       placeholder="https://openrouter.ai/api/v1"
-                      onChange={(event) => updateProviderProfile(journalProvider, { baseUrl: event.target.value })}
+                      onChange={(event) => updateProviderBaseUrl(journalProvider, event.target.value)}
                     />
                   </label>
                 </>

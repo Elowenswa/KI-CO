@@ -10,3 +10,6 @@ dist
 coverage
 docs/XIAOWU_*CHECKLIST.md
 icon-preview.html
+build
+release
+out

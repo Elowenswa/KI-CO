@@ -114,12 +114,18 @@ function cleanInlineTitle(text: string): string {
 function normalizeTitleCandidate(text: string): string {
   return cleanInlineTitle(text)
     .replace(/^自动回退摘要[:：]?\s*/i, "")
-    .replace(/^(Sasha|Solan|Assistant|User|用户|我)[:：]\s*/i, "")
+    .replace(/^(Assistant|User|用户|我)[:：]\s*/i, "")
     .replace(/^(title|标题|content|正文|summary|摘要)[:：]\s*/i, "")
     .replace(/^日期[:：].*$/i, "")
     .replace(/^记录者[:：].*$/i, "")
     .replace(/^在场者[:：].*$/i, "")
     .trim();
+}
+
+const CHRONICLE_TEMPLATE_LABEL_PATTERN = /(chronicleentry|diaryentry|memorycorridor|chronicles?|diary|时光回廊|日记)/g;
+
+function isDateOnlyChronicleHeading(value: string): boolean {
+  return /^(?:\d{4}(?:年)?\d{1,2}(?:月)?\d{1,2}(?:日)?|\d{4}(?:年)?\d{1,2}(?:月)?|\d{1,2}(?:月)\d{1,2}(?:日)?)$/u.test(value);
 }
 
 function isChronicleTemplateHeading(text: string): boolean {
@@ -128,10 +134,11 @@ function isChronicleTemplateHeading(text: string): boolean {
     .toLowerCase()
     .replace(/[\s·:：|｜\-—–_=📓📜✨⭐*#"'“”‘’()[\]{}<>「」『』.,，。]+/g, "");
   if (!compact) return true;
-  if (/^(chronicleentry|diaryentry|memorycorridor|chronicles|diary|日记|时光回廊)$/.test(compact)) return true;
-  if (compact.includes("chronicleentry") && compact.length <= 34) return true;
-  if (compact.includes("时光回廊") && compact.length <= 18) return true;
-  return false;
+  if (isDateOnlyChronicleHeading(compact)) return true;
+  const labels = compact.match(CHRONICLE_TEMPLATE_LABEL_PATTERN) || [];
+  if (!labels.length) return false;
+  const remainder = compact.replace(CHRONICLE_TEMPLATE_LABEL_PATTERN, "");
+  return !remainder || isDateOnlyChronicleHeading(remainder);
 }
 
 function isMeaningfulTitleCandidate(text?: string): boolean {

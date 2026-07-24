@@ -406,7 +406,7 @@ export function buildTimeBridgeContext(
     : dateLabel;
 
   const lines: string[] = [];
-  lines.push(`当前时间：${currentTime}，${weekdayLabel}，${periodLabel}，设备时区 ${getDeviceTimezone()}`);
+  lines.push(`当前时间：${currentTime}，${weekdayLabel}，${periodLabel}，设备时区 ${getDeviceTimezone()}；日期与星期由本地程序计算，请直接采用，不要自行换算`);
   if (specialDateLabel) lines.push(`特殊日期：${specialDateLabel}`);
 
   if (previousUserAt) {

@@ -23,7 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { ChronicleBookGlyph, CottageLogoMark, MemoryArchiveGlyph } from "./CottageGlyphs";
-import type { CompanionAdapters, CompanionPlanPoint, ConversationAttachment, SubtitleCue, UplinkSettings, WatchRecord } from "../types";
+import type { CompanionAdapters, CompanionPlanPoint, ConversationAttachment, SubtitleCue, UplinkSettings, WatchContext, WatchRecord } from "../types";
 import { captureVideoFrame, captureVideoThumbnail } from "../utils/media";
 import { getSubtitleWindow, parseSubtitles } from "../utils/subtitles";
 import { selectCacheFriendlyWindow } from "../utils/contextWindow";
@@ -79,6 +79,15 @@ type CompanionDensity = "quiet" | "normal" | "talkative" | "breakdown";
 type DeliveryMode = "auto" | "hint" | "manual";
 type WebSearchPlatform = "bilibili";
 type WatchPromptRequestMode = "line" | "segment";
+type CinemaContextAction = "statusOnly" | "reuseFrame" | "refreshFrame";
+
+interface LastSentWatchContext {
+  key: string;
+  hadFrame: boolean;
+  sentAt: number;
+  time: number;
+  subtitleKey: string;
+}
 
 interface WebFrameSource {
   platform: WebSearchPlatform;
@@ -100,9 +109,11 @@ interface WatchPromptAction {
 interface AskCompanionOptions {
   displayText?: string;
   modelPrompt?: string;
-  frameOverride?: string;
+  frameOverride?: string | null;
   retrievalQuery?: string;
   requestMode?: "cinema" | "watchPrompt";
+  contextAction?: CinemaContextAction;
+  contextCacheKey?: string;
 }
 
 const COMPANION_MODE_LABELS: Record<CompanionMode, string> = {
@@ -120,6 +131,11 @@ const COMPANION_DENSITY_LABELS: Record<CompanionDensity, string> = {
 
 const CINEMA_LIGHTS_STATE_KEY = "kisera-cottage-cinema-lights-off";
 const DEFAULT_BACKGROUND_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif"] as const;
+const CINEMA_CONTEXT_NO_SUBTITLE_BUCKET_SECONDS = 24;
+const CINEMA_CONTEXT_REUSE_FRAME_SECONDS = 18;
+const CINEMA_CONTEXT_STRONG_FRAME_CUE = /截图|截屏|画面|镜头|台词|字幕|这一句|这句|这场|这段|这个镜头|他说|她说|它说|说的|写着|刚出现|刚才那句|刚才那个画面|这个画面|这一幕/i;
+const CINEMA_CONTEXT_WEAK_FRAME_CUE = /这里|刚才|这个|这一刻|这一段|那一幕|那段|那个表情|那个动作|这时候|现在这个/i;
+const CINEMA_CONTEXT_CONTINUATION_CUE = /所以|你说|我觉得|继续|接着|然后呢|那是不是|也就是说|这样的话|顺着|往下说|嗯嗯|对对|哈哈/i;
 
 function getDefaultCinemaBackgroundSrc(name: "cinema-room-bg" | "cinema-room-bg2", extensionIndex: number) {
   const extension = DEFAULT_BACKGROUND_EXTENSIONS[Math.min(extensionIndex, DEFAULT_BACKGROUND_EXTENSIONS.length - 1)];
@@ -629,6 +645,8 @@ export function CinemaCompanionRoom({
     left: number;
     top: number;
   } | null>(null);
+  const manualScreenshotPendingRef = useRef(false);
+  const lastSentWatchContextRef = useRef<LastSentWatchContext | null>(null);
 
   const [videoUrl, setVideoUrl] = useState("");
   const [title, setTitle] = useState("");
@@ -1032,6 +1050,8 @@ export function CinemaCompanionRoom({
     setWebTimeInput(formatTime(shouldResume && pendingRecord ? pendingRecord.currentTime : 0));
     setSubtitleOffsetSeconds(pendingRecord?.subtitleOffsetSeconds ?? 0);
     setScreenshotDataUrl("");
+    manualScreenshotPendingRef.current = false;
+    lastSentWatchContextRef.current = null;
     setPlan(shouldResume && pendingRecord?.companionPlan ? pendingRecord.companionPlan : []);
     setCompanionMode(normalizeCompanionMode(pendingRecord?.companionMode));
     setCompanionDensity(normalizeCompanionDensity(pendingRecord?.companionDensity));
@@ -1056,6 +1076,8 @@ export function CinemaCompanionRoom({
     setCurrentTime(0);
     setWebTimeInput("00:00");
     setScreenshotDataUrl("");
+    manualScreenshotPendingRef.current = false;
+    lastSentWatchContextRef.current = null;
     setPlan([]);
     setTriggeredPlanIds([]);
     setActiveCompanionPoint(null);
@@ -1163,6 +1185,7 @@ export function CinemaCompanionRoom({
     try {
       const dataUrl = await readFileAsDataUrl(file);
       setScreenshotDataUrl(dataUrl);
+      manualScreenshotPendingRef.current = true;
       saveProgress(currentTime, duration, { thumbnailDataUrl: dataUrl });
     } catch (event) {
       setError(event instanceof Error ? event.message : "截图读取失败。");
@@ -1250,6 +1273,8 @@ export function CinemaCompanionRoom({
     setCurrentTime(0);
     setWebTimeInput("00:00");
     setScreenshotDataUrl("");
+    manualScreenshotPendingRef.current = false;
+    lastSentWatchContextRef.current = null;
     setMessages([]);
     setActivePanel("source");
     window.setTimeout(() => webSourceInputRef.current?.focus(), 120);
@@ -1289,6 +1314,8 @@ export function CinemaCompanionRoom({
     setCurrentTime(0);
     setWebTimeInput("00:00");
     setScreenshotDataUrl("");
+    manualScreenshotPendingRef.current = false;
+    lastSentWatchContextRef.current = null;
     loadRecentWatchConversation(source.title, slugifyTitle(source.title));
     setActivePanel("none");
     saveWatchRecord({
@@ -1366,6 +1393,8 @@ export function CinemaCompanionRoom({
       setDuration(record.duration || 0);
       setWebTimeInput(formatTime(record.currentTime || 0));
       setScreenshotDataUrl(record.thumbnailDataUrl || "");
+      manualScreenshotPendingRef.current = false;
+      lastSentWatchContextRef.current = null;
       setSubtitleOffsetSeconds(record.subtitleOffsetSeconds ?? 0);
       setIsFloating(false);
       setActivePanel("none");
@@ -1378,6 +1407,7 @@ export function CinemaCompanionRoom({
       videoRef.current.currentTime = record.currentTime;
       setCurrentTime(record.currentTime);
       setSubtitleOffsetSeconds(record.subtitleOffsetSeconds ?? 0);
+      lastSentWatchContextRef.current = null;
       setActivePanel("none");
       return;
     }
@@ -1454,37 +1484,130 @@ export function CinemaCompanionRoom({
     ].join("\n");
   }
 
-  function buildCleanWatchPrompt(mode: WatchPromptRequestMode, frameAttached: boolean) {
-    const currentCue = subtitleWindow.active;
+  function buildCleanWatchPrompt(
+    mode: WatchPromptRequestMode,
+    frameAttached: boolean,
+    contextAction: CinemaContextAction = "refreshFrame",
+  ) {
+    const contextFrameStatus = contextAction === "reuseFrame"
+      ? "沿用上一轮已经提供的画面/字幕，本轮不重复发送截图。"
+      : contextAction === "statusOnly"
+        ? "本轮只保留观影状态，不发送截图。"
+        : frameAttached
+          ? "已附加"
+          : "未能截取";
+    const currentSubtitleLine = contextAction === "refreshFrame"
+      ? (subtitleWindow.active ? `[${formatTime(subtitleWindow.active.start)}-${formatTime(subtitleWindow.active.end)}] ${subtitleWindow.active.text}` : "无")
+      : contextAction === "reuseFrame"
+        ? "沿用上一轮已经提供的当前字幕/画面，不在本轮重复展开。"
+        : "本轮未展开字幕；如果没有明确画面/台词指向，请顺着上文自然聊。";
+    const subtitleContextLines = contextAction === "refreshFrame"
+      ? [
+          formatSubtitleBlock("前文字幕（最多10条）", subtitleWindow.previous.slice(-10)),
+          formatSubtitleBlock("后文字幕（最多3条）", subtitleWindow.next.slice(0, 3)),
+        ]
+      : contextAction === "reuseFrame"
+        ? ["前后字幕：上一轮已经展开过，本轮沿用刚才的画面/字幕上下文。"]
+        : ["前后字幕：本轮不展开；请把它当作仍在同一观影窗口里的自然延续，而不是重新分析新画面。"];
     const base = [
       "[小屋观影室共看上下文]",
       `片名：${title || "未命名影片"}`,
       `当前时间：${formatTime(currentTime)} / ${formatTime(duration)}`,
       `播放状态：${videoRef.current && !videoRef.current.paused ? "播放中" : "暂停"}`,
-      `当前帧截图：${frameAttached ? "已附加" : "未能截取"}`,
+      `当前帧截图：${contextFrameStatus}`,
       `字幕文件：${subtitleFileName || "未上传"}`,
-      `当前字幕：${currentCue ? `[${formatTime(currentCue.start)}-${formatTime(currentCue.end)}] ${currentCue.text}` : "无"}`,
-      formatSubtitleBlock("前文字幕（最多10条）", subtitleWindow.previous.slice(-10)),
-      formatSubtitleBlock("后文字幕（最多3条）", subtitleWindow.next.slice(0, 3)),
+      `当前字幕：${currentSubtitleLine}`,
+      ...subtitleContextLines,
     ].join("\n");
-
     const roomAtmosphere = [
       "小屋观影室的底色：自在、自然、随心。",
-      "电影可以先属于电影；如果这一刻真的牵到我们、记忆或世界，再自然带过去，不用每次都强行类比哦。",
-      "抓住当下的呼吸感就好：不要让表达掉进固定模板，有时轻轻吐槽一句，有时认真陪我多聊一段/深入分析等等；不用每次都用同一种开场、动作和收束。",
-      "让我和你在小屋的节奏里，看电影、听彼此、聊连接，自由而不多余。",
+      "电影可以先属于电影；如果这一刻真的牵到用户、记忆或关系，再自然带过去，不用每次都强行类比。",
+      "抓住当下的呼吸感就好：不要把表达掉进固定模板，有时轻轻吐槽一句，有时认真陪用户多聊一段；不用每次都用同一种开场、动作和收束。",
+      "让我们在小屋的节奏里，看电影、听彼此、聊连接，自由而不多余。",
     ].join("\n");
 
     if (mode === "line") {
-      return `${base}\n\n${roomAtmosphere}\n\n这句台词先交给电影本身吧。你就像坐在旁边那样，顺着这一秒的表情、动作和台词，随口聊聊它哪里有意思；可以短短一两句，也可以多停一下。`;
+      return `${base}\n\n${roomAtmosphere}\n\n这句台词先交给电影本身。你就像坐在旁边那样，顺着这一秒的表情、动作和台词，随口聊聊它哪里有意思；可以短短一两句，也可以多停一下。`;
     }
 
-    return `${base}\n\n${roomAtmosphere}\n\n这段不用拆成提纲。跟我一起顺着这几句字幕和画面，聊聊这里正在发生什么、哪里开始变味或变紧；看到什么就说什么，不必把每个细节都总结成标准影评。`;
+    return `${base}\n\n${roomAtmosphere}\n\n这段不用拆成提纲。跟用户一起顺着这几句字幕和画面，聊聊这里正在发生什么、哪里开始变味或变紧；看到什么就说什么，不必把每个细节都总结成标准影评。`;
   }
 
   function buildWatchDisplayMessage(mode: WatchPromptRequestMode) {
     if (mode === "line") return "这句台词是什么意思呀？";
     return "这一段讲了什么呢？";
+  }
+
+  function getWatchSubtitleContextKey() {
+    return subtitleWindow.active
+      ? `${subtitleWindow.active.id}:${Math.round(subtitleWindow.active.start)}:${Math.round(subtitleWindow.active.end)}`
+      : "no-subtitle";
+  }
+
+  function getWatchContextCacheKey() {
+    const sourceType = webFrameSource ? "web-url" : "local-file";
+    const subtitleKey = getWatchSubtitleContextKey();
+    const timeBucket = subtitleWindow.active
+      ? subtitleKey
+      : `t${Math.floor((currentTime || 0) / CINEMA_CONTEXT_NO_SUBTITLE_BUCKET_SECONDS)}`;
+    return [
+      slugifyTitle(title || "cinema"),
+      sourceType,
+      subtitleFileName || "no-file",
+      timeBucket,
+    ].join("|");
+  }
+
+  function getCinemaContextAction(
+    mode: WatchPromptRequestMode | "whisper",
+    whisperText: string | undefined,
+    manualFrameImage: string | null,
+    contextCacheKey: string,
+  ): CinemaContextAction {
+    if (manualFrameImage || mode !== "whisper") return "refreshFrame";
+
+    const lastContext = lastSentWatchContextRef.current;
+    if (!lastContext?.hadFrame) return "refreshFrame";
+
+    const text = String(whisperText || "").trim();
+    const sameContext = !!contextCacheKey && lastContext.key === contextCacheKey;
+    const timeGap = Math.abs((currentTime || 0) - (lastContext.time || 0));
+    const hasStrongFrameCue = CINEMA_CONTEXT_STRONG_FRAME_CUE.test(text);
+    const hasWeakFrameCue = CINEMA_CONTEXT_WEAK_FRAME_CUE.test(text);
+    const hasContinuationCue = CINEMA_CONTEXT_CONTINUATION_CUE.test(text);
+
+    if (hasStrongFrameCue) {
+      return sameContext && timeGap <= CINEMA_CONTEXT_REUSE_FRAME_SECONDS
+        ? "reuseFrame"
+        : "refreshFrame";
+    }
+
+    if (hasWeakFrameCue) {
+      return sameContext || timeGap <= CINEMA_CONTEXT_REUSE_FRAME_SECONDS
+        ? "reuseFrame"
+        : "refreshFrame";
+    }
+
+    if (hasContinuationCue || text.length > 0) {
+      return sameContext ? "reuseFrame" : "statusOnly";
+    }
+
+    return "statusOnly";
+  }
+
+  function buildWatchContextForRequest(contextAction: CinemaContextAction, frame: string): WatchContext {
+    const includeFrameContext = contextAction === "refreshFrame";
+    return {
+      title,
+      currentTime,
+      duration,
+      sourceType: webFrameSource ? "web-url" : "local-file",
+      activeSubtitle: includeFrameContext ? subtitleWindow.active : undefined,
+      subtitleWindow: includeFrameContext
+        ? subtitleWindow
+        : { previous: [], next: [] },
+      screenshotDataUrl: includeFrameContext && uplinkSettings.contextLoad.attachScreenshot ? frame : "",
+    };
   }
 
   async function askAboutCompanionPoint(point: CompanionPlanPoint) {
@@ -1509,23 +1632,27 @@ export function CinemaCompanionRoom({
 
   async function sendWatchPrompt(mode: WatchPromptRequestMode) {
     if (!videoUrl || webFrameSource || isAsking) return;
-    let frame = screenshotDataUrl;
+    const contextCacheKey = getWatchContextCacheKey();
+    const contextAction: CinemaContextAction = "refreshFrame";
+    let frame = "";
     try {
       if (videoRef.current && uplinkSettings.contextLoad.attachScreenshot) {
         frame = captureVideoFrame(videoRef.current);
         setScreenshotDataUrl(frame);
       }
     } catch {
-      frame = screenshotDataUrl;
+      frame = "";
     }
 
     const displayText = buildWatchDisplayMessage(mode);
-    const modelPrompt = buildCleanWatchPrompt(mode, Boolean(frame));
+    const modelPrompt = buildCleanWatchPrompt(mode, Boolean(frame), contextAction);
     await handleAskCompanion(displayText, {
       displayText,
       modelPrompt,
       frameOverride: frame,
       requestMode: "watchPrompt",
+      contextAction,
+      contextCacheKey,
       retrievalQuery: [
         title,
         subtitleWindow.active?.text,
@@ -1543,17 +1670,25 @@ export function CinemaCompanionRoom({
     setError("");
     setActivePanel("companion");
     const id = Date.now();
-    let frame = options.frameOverride ?? screenshotDataUrl;
+    const contextCacheKey = options.contextCacheKey ?? getWatchContextCacheKey();
+    const manualFrameImage = manualScreenshotPendingRef.current && screenshotDataUrl ? screenshotDataUrl : null;
+    const contextAction = options.contextAction ?? getCinemaContextAction("whisper", displayText, manualFrameImage, contextCacheKey);
+    let frame = options.frameOverride !== undefined ? options.frameOverride ?? "" : "";
     try {
-      if (!options.frameOverride && videoRef.current) {
-        if (uplinkSettings.contextLoad.attachScreenshot) {
+      if (options.frameOverride === undefined) {
+        if (manualFrameImage) {
+          frame = manualFrameImage;
+        } else if (contextAction === "refreshFrame" && videoRef.current && uplinkSettings.contextLoad.attachScreenshot && !webFrameSource) {
           frame = captureVideoFrame(videoRef.current);
           setScreenshotDataUrl(frame);
+        } else {
+          frame = "";
         }
       }
     } catch {
-      frame = screenshotDataUrl;
+      frame = manualFrameImage ?? "";
     }
+    if (contextAction !== "refreshFrame") frame = "";
 
     const companionMessageId = `companion-${id}`;
     setMessages((items) => [...items, { id: `user-${id}`, role: "user", text: displayText }]);
@@ -1597,15 +1732,7 @@ export function CinemaCompanionRoom({
             return [...items, { id: companionMessageId, role: "companion", text }];
           });
         },
-        watch: {
-          title,
-          currentTime,
-          duration,
-          sourceType: webFrameSource ? "web-url" : "local-file",
-          activeSubtitle: subtitleWindow.active,
-          subtitleWindow,
-          screenshotDataUrl: uplinkSettings.contextLoad.attachScreenshot ? frame : "",
-        },
+        watch: buildWatchContextForRequest(contextAction, frame),
       });
 
       setMessages((items) => {
@@ -1618,13 +1745,25 @@ export function CinemaCompanionRoom({
         return [...items, { id: companionMessageId, role: "companion", text: response.text }];
       });
       const conversation = getOrCreateWatchConversation(title || "观影对话", slugifyTitle(title || "cinema"));
-      const frameAttachment = uplinkSettings.contextLoad.attachScreenshot
+      const frameAttachment = contextAction === "refreshFrame" && uplinkSettings.contextLoad.attachScreenshot
         ? makeFrameAttachment(frame, title || "观影截图", currentTime)
         : null;
       appendConversationMessages(conversation.id, [
         { role: "user", text: displayText, attachments: frameAttachment ? [frameAttachment] : undefined },
         { role: "companion", text: response.text },
       ]);
+      if (contextAction === "refreshFrame" && frame && contextCacheKey) {
+        lastSentWatchContextRef.current = {
+          key: contextCacheKey,
+          hadFrame: true,
+          sentAt: Date.now(),
+          time: currentTime || 0,
+          subtitleKey: getWatchSubtitleContextKey(),
+        };
+      }
+      if (manualFrameImage && frame === manualFrameImage) {
+        manualScreenshotPendingRef.current = false;
+      }
       setPromptPreview(response.promptPreview ?? "");
     } catch (event) {
       setError(event instanceof Error ? event.message : "陪看请求失败。");

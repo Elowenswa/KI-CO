@@ -100,6 +100,10 @@ function formatClaudeCacheTtlForDebug(ttl: ClaudeResolvedCacheTtl): string {
 }
 
 function getMaxOutputTokens(settings: UplinkSettings, request: CompanionRequest): number {
+  const override = Number(request.maxOutputTokensOverride);
+  if (Number.isFinite(override) && override > 0) {
+    return Math.max(32, Math.min(4096, Math.floor(override)));
+  }
   // A cinema plan is a one-shot JSON document with many timed points. A low
   // chat reply cap can truncate it into unusable JSON while still costing a call.
   return request.mode === "plan"
@@ -430,6 +434,26 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
   }
 
   if (request.mode === "chat") {
+    if (request.purpose === "topic-recall-judge") {
+      return [
+        request.personaCore,
+        "",
+        request.userMessage,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    if (request.purpose === "session-state") {
+      return [
+        request.personaCore,
+        request.userContext,
+        request.userMessage,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
     if (request.channel === "journal") {
       return [
         "You are writing a private chronicle in-character, natural and intimate, never like a system log.",
@@ -983,7 +1007,9 @@ async function completeWithOpenAICompatible(
   request: CompanionRequest,
 ): Promise<CompanionResponse> {
   const promptPreview = buildCompanionPrompt(request);
-  const temperature = settings.temperature;
+  const temperature = Number.isFinite(request.temperatureOverride)
+    ? Number(request.temperatureOverride)
+    : settings.temperature;
   const maxOutputTokens = getMaxOutputTokens(settings, request);
   const endpoint = `${trimTrailingSlash(profile.baseUrl)}/chat/completions`;
   const cacheProvider = resolvePromptCacheProvider(provider, profile);
@@ -1310,7 +1336,9 @@ async function completeWithClaude(
   request: CompanionRequest,
 ): Promise<CompanionResponse> {
   const promptPreview = buildCompanionPrompt(request);
-  const temperature = settings.temperature;
+  const temperature = Number.isFinite(request.temperatureOverride)
+    ? Number(request.temperatureOverride)
+    : settings.temperature;
   const maxOutputTokens = getMaxOutputTokens(settings, request);
   const promptCacheParts = buildClaudePromptCachePlan(request, promptPreview, profile.model);
   const claudeCacheTtl = resolveClaudeCacheTtl(settings, request);
@@ -1467,7 +1495,9 @@ async function completeWithGemini(
   request: CompanionRequest,
 ): Promise<CompanionResponse> {
   const promptPreview = buildCompanionPrompt(request);
-  const temperature = settings.temperature;
+  const temperature = Number.isFinite(request.temperatureOverride)
+    ? Number(request.temperatureOverride)
+    : settings.temperature;
   const maxOutputTokens = getMaxOutputTokens(settings, request);
   const parts: any[] = [{ text: promptPreview }];
   const image = settings.contextLoad.attachScreenshot ? getDataUrlParts(request.watch.screenshotDataUrl) : null;

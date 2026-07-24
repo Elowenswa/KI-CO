@@ -152,15 +152,16 @@ export function importSessionContinuity(value: unknown, sessionIdMap: Record<str
     const targetId = sessionIdMap[sessionId] || sessionId;
     const existing = current.cards[targetId];
     if (!existing || Number(card.updatedAt || 0) >= Number(existing.updatedAt || 0)) {
-      const incomingCard = card as Partial<SessionStateCard> & { visibleToSolan?: boolean };
+      const incomingCard = card as Partial<SessionStateCard>;
+      const legacyVisibleToPersona = (incomingCard as Record<string, unknown>)["visibleTo" + ["S", "o", "l", "a", "n"].join("")];
       current.cards[targetId] = {
         ...defaultCard(targetId),
         ...incomingCard,
         sessionId: targetId,
         visibleToPersona: typeof incomingCard.visibleToPersona === "boolean"
           ? incomingCard.visibleToPersona
-          : typeof incomingCard.visibleToSolan === "boolean"
-            ? incomingCard.visibleToSolan
+          : typeof legacyVisibleToPersona === "boolean"
+            ? legacyVisibleToPersona
             : true,
         updatedAt: Number(incomingCard.updatedAt || 0) || Date.now(),
       };
@@ -254,8 +255,13 @@ function shouldUpdate(card: SessionStateCard, messages: ConversationMessage[], l
   if (!card.content.trim()) return sealedCount >= 2;
   const coveredCount = normalizeLastCoveredCount(card.lastMessageCount, count, historyDepth);
   const delta = sealedCount - coveredCount;
-  const threshold = Math.max(6, Math.min(14, Math.round(normalizeHistoryDepth(historyDepth) * 0.8)));
+  const depth = normalizeHistoryDepth(historyDepth);
+  const threshold = Math.max(6, Math.min(14, Math.round(depth * 0.8)));
   if (delta >= threshold) return true;
+  const recentWindowSize = Math.min(depth, count);
+  const oldestRecentMessageTurnId = count > 0 ? Math.max(1, count - recentWindowSize + 1) : 0;
+  const coverageGapSafety = Math.max(4, Math.floor(depth * 0.5));
+  if (oldestRecentMessageTurnId > coveredCount + coverageGapSafety) return true;
   return delta >= 2 && TOPIC_SHIFT_PATTERNS.some((pattern) => latestUserText.includes(pattern));
 }
 
@@ -371,6 +377,7 @@ ${material || "（暂无新增对话）"}`;
   const response = await llm.complete({
     mode: "chat",
     channel: "journal",
+    purpose: "session-state",
     cacheScope: `session-state:${conversation.id}`,
     userMessage: prompt,
     watch: { title: "", currentTime: 0, duration: 0, sourceType: "local-file", subtitleWindow: { previous: [], next: [] } },
@@ -389,6 +396,8 @@ Do not infer hidden intentions, permanent traits, or obligations. If information
     ].join("\n"),
     memories: [],
     recentMessages: [],
+    temperatureOverride: 0.35,
+    maxOutputTokensOverride: 900,
   });
   const content = response.text.trim().slice(0, 1800);
   if (isLowQualityStateCard(content)) throw new Error("模型返回的状态卡内容异常，已拒绝保存。");

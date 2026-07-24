@@ -75,6 +75,16 @@ export interface ContextRetrievalTurn {
   supplementReason?: string;
   refreshReason?: string;
   topicMemorySetHash?: string;
+  topicMemorySetRestored?: boolean;
+  restoredTopicMemorySetId?: string;
+  topicMemorySetRestoreReason?: string;
+  topicMemorySetRestoreScore?: number;
+  topicMemorySetRestoreCurrentScore?: number;
+  topicMemorySetRestoreMatchedTokens?: string[];
+  topicMemorySetRestoreCurrentMatchedTokens?: string[];
+  topicMemorySetRestoreCoveredByCurrent?: boolean;
+  topicMemorySetRestoreCandidateCount?: number;
+  topicMemorySetRecentCount?: number;
   turnsSinceRefresh?: number;
   supplementCount?: number;
   reusedMemoryCount?: number;
@@ -92,6 +102,26 @@ export interface ContextRetrievalTurn {
   supplementCandidateCount?: number;
   supplementMergedNewCount?: number;
   topicMemoryHashChangedBecause?: string;
+  topicJudgeUsed?: boolean;
+  topicJudgeDecision?: string;
+  topicJudgeNeedsRecall?: boolean | null;
+  topicJudgeConfidence?: string;
+  topicJudgeReason?: string;
+  topicJudgeEligibilityReason?: string;
+  topicJudgeRecallSignal?: boolean;
+  topicJudgeError?: string;
+  topicJudgeSkippedReason?: string;
+  topicJudgeConsecutiveTurns?: number;
+  topicJudgeCooldownUntilTurn?: number;
+  modelFallbackUsed?: boolean;
+  modelFallbackSkipReason?: string;
+  modelFallbackCallsInWindow?: number;
+  modelFallbackConsecutiveCount?: number;
+  modelFallbackCooldownRemaining?: number;
+  finalTopicDecisionSource?: string;
+  topicGateOriginalDecision?: string;
+  topicGateOriginalReason?: string;
+  topicGateOriginalWinningRule?: string;
 }
 
 export interface MemoryEntry {
@@ -262,8 +292,53 @@ const SOURCE_WEIGHT: Record<MemorySourceType, number> = {
   raw_memory: 1.1,
 };
 
+const RECENCY_TOPIC_HINTS = [
+  "成长日志",
+  "融合核",
+  "核心记忆",
+  "growth log",
+  "fusion core",
+  "core memory",
+];
+
 function isAutoIndexableCoreDoc(doc: SourceDoc): boolean {
   return doc.sourceType === "memory-bank" || doc.sourceType === "chronicle";
+}
+
+export function computeRetrievalRecencyBonus(
+  query: string,
+  doc: Pick<SourceDoc, "sourceType" | "title" | "content" | "tags" | "aliases" | "createdAt">,
+  nowMs: number = Date.now(),
+): number {
+  if (!["memory-bank", "chronicle", "obsidian_note"].includes(doc.sourceType)) return 0;
+  const normalizedQuery = normalizeRetrievalQuery(query);
+  const docText = normalizeRetrievalQuery(
+    `${doc.title || ""} ${(doc.tags || []).join(" ")} ${(doc.aliases || []).join(" ")} ${String(doc.content || "").slice(0, 360)}`,
+  );
+  const createdAt = Number(doc.createdAt || 0);
+  if (!Number.isFinite(createdAt) || createdAt <= 0) return 0;
+  const ageDays = Math.max(0, (nowMs - createdAt) / (1000 * 60 * 60 * 24));
+  const stageSensitive = RECENCY_TOPIC_HINTS.some((hint) => {
+    const normalizedHint = normalizeRetrievalQuery(hint);
+    return normalizedQuery.includes(normalizedHint) && docText.includes(normalizedHint);
+  });
+
+  if (stageSensitive) {
+    if (ageDays <= 7) return 0.12;
+    if (ageDays <= 30) return 0.08;
+    if (ageDays <= 90) return 0.05;
+    if (ageDays <= 180) return 0.03;
+    if (ageDays <= 365) return 0.015;
+    return 0;
+  }
+
+  if (doc.sourceType !== "chronicle") return 0;
+  if (ageDays <= 7) return 0.06;
+  if (ageDays <= 30) return 0.04;
+  if (ageDays <= 90) return 0.025;
+  if (ageDays <= 180) return 0.015;
+  if (ageDays <= 365) return 0.008;
+  return 0;
 }
 
 export const DEFAULT_MEMORY_ENTRIES: MemoryEntry[] = [
@@ -385,9 +460,28 @@ function tokenize(value: string): string[] {
 
 function normalizeRetrievalQuery(value: string): string {
   return value
+    .normalize("NFKC")
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function compactLiteralPhrase(value: string): string {
+  return normalizeRetrievalQuery(value)
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "")
+    .trim();
+}
+
+export function matchLiteralTitleQuery(
+  query: string,
+  title: string,
+  aliases: string[] = [],
+): "title" | "alias" | "none" {
+  const compactQuery = compactLiteralPhrase(query);
+  if (compactQuery.length < 2) return "none";
+  if (compactLiteralPhrase(title).includes(compactQuery)) return "title";
+  if (compactLiteralPhrase(aliases.join(" ")).includes(compactQuery)) return "alias";
+  return "none";
 }
 
 function readRetrievalStats(): Omit<LocalRetrievalStats, "total" | "hitRate" | "cacheSize"> {
@@ -1025,6 +1119,32 @@ function isRelevantExternalContextRow(row: {
   return row.fusedScore >= 0.42 || row.vectorScore >= 0.34;
 }
 
+export function prioritizeLiteralContextRows<T>(rows: T[]): T[] {
+  const literalMeta = (row: T) => row as T & {
+    literalPriority?: number;
+    strongLiteralPass?: boolean;
+  };
+  if (!rows.some((row) => {
+    const meta = literalMeta(row);
+    return (meta.literalPriority || 0) > 0 || meta.strongLiteralPass;
+  })) return rows;
+  return rows
+    .map((row, index) => ({ row, index }))
+    .sort((left, right) => {
+      const leftMeta = literalMeta(left.row);
+      const rightMeta = literalMeta(right.row);
+      const leftExact = (leftMeta.literalPriority || 0) >= 800 ? 1 : 0;
+      const rightExact = (rightMeta.literalPriority || 0) >= 800 ? 1 : 0;
+      return (
+        rightExact - leftExact
+        || Number(!!rightMeta.strongLiteralPass) - Number(!!leftMeta.strongLiteralPass)
+        || (rightMeta.literalPriority || 0) - (leftMeta.literalPriority || 0)
+        || left.index - right.index
+      );
+    })
+    .map(({ row }) => row);
+}
+
 function diversifyContextRows<Row extends { doc: SourceDoc }>(rows: Row[], limit: number): Row[] {
   const k = Math.max(0, limit);
   if (k <= 0) return [];
@@ -1083,7 +1203,7 @@ function makeRetrievalCacheKey(entries: MemoryEntry[], query: string, limit: num
         .join("|")
     : "";
   return JSON.stringify({
-    mode: "cottage-memory-v2",
+    mode: "cottage-memory-v20260719-literal-title-priority",
     limit,
     query: normalizeRetrievalQuery(query),
     signature: memorySignature(entries),
@@ -1161,6 +1281,16 @@ export type ContextRetrievalMeta = Partial<Pick<
   | "supplementReason"
   | "refreshReason"
   | "topicMemorySetHash"
+  | "topicMemorySetRestored"
+  | "restoredTopicMemorySetId"
+  | "topicMemorySetRestoreReason"
+  | "topicMemorySetRestoreScore"
+  | "topicMemorySetRestoreCurrentScore"
+  | "topicMemorySetRestoreMatchedTokens"
+  | "topicMemorySetRestoreCurrentMatchedTokens"
+  | "topicMemorySetRestoreCoveredByCurrent"
+  | "topicMemorySetRestoreCandidateCount"
+  | "topicMemorySetRecentCount"
   | "turnsSinceRefresh"
   | "supplementCount"
   | "reusedMemoryCount"
@@ -1178,6 +1308,26 @@ export type ContextRetrievalMeta = Partial<Pick<
   | "supplementCandidateCount"
   | "supplementMergedNewCount"
   | "topicMemoryHashChangedBecause"
+  | "topicJudgeUsed"
+  | "topicJudgeDecision"
+  | "topicJudgeNeedsRecall"
+  | "topicJudgeConfidence"
+  | "topicJudgeReason"
+  | "topicJudgeEligibilityReason"
+  | "topicJudgeRecallSignal"
+  | "topicJudgeError"
+  | "topicJudgeSkippedReason"
+  | "topicJudgeConsecutiveTurns"
+  | "topicJudgeCooldownUntilTurn"
+  | "modelFallbackUsed"
+  | "modelFallbackSkipReason"
+  | "modelFallbackCallsInWindow"
+  | "modelFallbackConsecutiveCount"
+  | "modelFallbackCooldownRemaining"
+  | "finalTopicDecisionSource"
+  | "topicGateOriginalDecision"
+  | "topicGateOriginalReason"
+  | "topicGateOriginalWinningRule"
 >>;
 
 function readContextRetrievalHistory(): ContextRetrievalTurn[] {
@@ -1560,9 +1710,17 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
           : 0;
       const literal = literalBonus(doc, tokens, retrieval);
       const phraseHits = exactQueryPhraseHits(normalizedQuery, doc);
-      const phraseBoost = phraseHits.length
-        ? Math.min(0.8, 0.18 + phraseHits[0].length * 0.035)
-        : 0;
+      const compactQueryPhrase = compactLiteralPhrase(normalizedQuery);
+      const exactTitleMatch = matchLiteralTitleQuery(normalizedQuery, doc.title, doc.aliases);
+      const exactTitleQueryHit = exactTitleMatch === "title";
+      const exactAliasQueryHit = exactTitleMatch === "alias";
+      const phraseBoost = exactTitleQueryHit
+        ? 0.52
+        : exactAliasQueryHit
+          ? 0.34
+          : phraseHits.length
+            ? Math.min(0.8, 0.18 + phraseHits[0].length * 0.035)
+            : 0;
       const normalizedLocalScore = localScore / Math.max(1, tokens.length * 2);
       const localComponent = mode === "vector" ? 0 : normalizedLocalScore;
       const vectorComponent = mode === "local" ? 0 : Math.max(0, vectorScore);
@@ -1573,10 +1731,11 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
           : localComponent;
       const sourceWeight = SOURCE_WEIGHT[doc.sourceType] || 1;
       const fusedBeforeRerank = (baseScore + literal.bonus + phraseBoost) * sourceWeight;
-      const recencyBonus = Math.max(0, 0.08 - Math.max(0, Date.now() - doc.updatedAt) / (1000 * 60 * 60 * 24 * 365) * 0.02);
+      const recencyBonus = computeRetrievalRecencyBonus(normalizedQuery, doc);
+      const scoreWithRecency = fusedBeforeRerank + recencyBonus;
       const heuristicScore = retrieval.vectorRerank
-        ? fusedBeforeRerank * 0.8 + vectorComponent * sourceWeight * 0.2 + recencyBonus + Math.max(0, doc.importance) * 0.02
-        : fusedBeforeRerank;
+        ? scoreWithRecency * 0.8 + vectorComponent * sourceWeight * 0.2 + Math.max(0, doc.importance) * 0.02
+        : scoreWithRecency;
       const crossScore = retrieval.vectorRerank && retrieval.vectorCrossEncoderRerank
         ? computeCrossEncoderLiteScore(normalizedQuery, doc)
         : 0;
@@ -1589,9 +1748,21 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
         sourceWeight,
         fusedScoreBeforeRerank: fusedBeforeRerank,
         fusedScore,
-        matchedTokens: [...phraseHits, ...literal.matchedTokens],
-        literalPriority: phraseHits.reduce((sum, phrase) => sum + phrase.length, 0) + (literal.exact !== "none" ? literal.matchedTokens.length : 0),
-        strongLiteralPass: phraseHits.length > 0 || (literal.exact !== "none" && literal.matchedTokens.length >= 3 && localScore >= 6),
+        matchedTokens: [
+          ...(exactTitleQueryHit || exactAliasQueryHit ? [compactQueryPhrase] : []),
+          ...phraseHits,
+          ...literal.matchedTokens,
+        ],
+        literalPriority: exactTitleQueryHit
+          ? 1000 + compactQueryPhrase.length
+          : exactAliasQueryHit
+            ? 800 + compactQueryPhrase.length
+            : phraseHits.reduce((sum, phrase) => sum + phrase.length, 0)
+              + (literal.exact !== "none" ? literal.matchedTokens.length : 0),
+        strongLiteralPass: exactTitleQueryHit
+          || exactAliasQueryHit
+          || phraseHits.length > 0
+          || (literal.exact !== "none" && literal.matchedTokens.length >= 3 && localScore >= 6),
       };
     });
 
@@ -1635,7 +1806,8 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
 
   const externallyRelevantRanked = ranked.filter(isRelevantExternalContextRow);
   const relevantRanked = externallyRelevantRanked.length ? externallyRelevantRanked : ranked;
-  const diversifiedRows = diversifyContextRows(relevantRanked, effectiveLimit);
+  const literalPrioritizedRows = prioritizeLiteralContextRows(relevantRanked);
+  const diversifiedRows = diversifyContextRows(literalPrioritizedRows, effectiveLimit);
   const selectedRows: typeof ranked = [];
   const seenParents = new Set<string>();
   let usedChars = 0;
@@ -1763,17 +1935,29 @@ export function importMemoryJson(text: string): MemoryImportStats {
       continue;
     }
 
-    next[index] = {
-      ...next[index],
-      ...entry,
-      tags: uniqueClean([...(next[index].tags || []), ...entry.tags], MAX_TAGS),
-      aliases: buildAliases(entry.content || next[index].content, [...(next[index].tags || []), ...entry.tags], [
-        ...(next[index].aliases || []),
+    const existing = next[index];
+    const mergedContent = existing.content.trim() || entry.content;
+    const mergedTags = uniqueClean([...(existing.tags || []), ...entry.tags], MAX_TAGS);
+    const mergedAliases = buildAliases(mergedContent, mergedTags, [
+        ...(existing.aliases || []),
         ...entry.aliases,
-      ]),
-      importance: Math.max(next[index].importance, entry.importance),
-      updatedAt: nowIso(),
+    ]);
+    const mergedEntry: MemoryEntry = {
+      ...existing,
+      title: existing.title.trim() || entry.title,
+      content: mergedContent,
+      tags: mergedTags,
+      aliases: mergedAliases,
+      importance: Math.max(existing.importance, entry.importance),
+      createdAt: existing.createdAt || entry.createdAt,
+      updatedAt: existing.updatedAt,
+      sourceType: existing.sourceType || entry.sourceType,
+      sourceId: existing.sourceId || entry.sourceId,
+      sourceTitle: existing.sourceTitle || entry.sourceTitle,
     };
+    const changed = JSON.stringify(existing) !== JSON.stringify(mergedEntry);
+    if (!changed) continue;
+    next[index] = { ...mergedEntry, updatedAt: nowIso() };
     merged += 1;
   }
 

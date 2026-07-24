@@ -154,14 +154,28 @@ export function importChronicles(value: unknown): { added: number; merged: numbe
       added += 1;
       return;
     }
-    byId.set(incoming.id, {
+    const mergedEntry: ChronicleEntry = {
       ...existing,
-      ...incoming,
+      title: existing.title.trim() || incoming.title,
+      diaryTitle: String(existing.diaryTitle || "").trim() || incoming.diaryTitle,
       content: incoming.content.length > existing.content.length ? incoming.content : existing.content,
+      dateRange: existing.dateRange.trim() || incoming.dateRange,
+      createdAt: Number.isFinite(existing.createdAt) && existing.createdAt > 0 ? existing.createdAt : incoming.createdAt,
+      updatedAt: existing.updatedAt,
+      isActive: existing.isActive,
+      starred: existing.starred || incoming.starred,
+      mode: existing.mode || incoming.mode,
       triggerKeywords: uniqueStrings([...existing.triggerKeywords, ...incoming.triggerKeywords]),
       facts: uniqueStrings([...existing.facts, ...incoming.facts], 20),
-      starred: existing.starred || incoming.starred,
-    });
+      sessionId: existing.sessionId || incoming.sessionId,
+      sessionTitle: existing.sessionTitle || incoming.sessionTitle,
+      personaId: existing.personaId || incoming.personaId,
+      personaName: existing.personaName || incoming.personaName,
+      roundCount: existing.roundCount || incoming.roundCount,
+    };
+    const changed = JSON.stringify(existing) !== JSON.stringify(mergedEntry);
+    if (!changed) { skipped += 1; return; }
+    byId.set(incoming.id, { ...mergedEntry, updatedAt: Date.now() });
     merged += 1;
   });
   if (added || merged) saveChronicles([...byId.values()]);
@@ -217,6 +231,69 @@ export function listMemorySeeds(includeResolved = false): MemorySeed[] {
 export function saveMemorySeeds(seeds: MemorySeed[]) {
   localStorage.setItem(CHRONICLE_SEEDS_KEY, JSON.stringify(seeds));
   emitUpdate();
+}
+
+export function importMemorySeeds(value: unknown): { added: number; merged: number; skipped: number } {
+  const rows = Array.isArray(value) ? value : [];
+  const current = listMemorySeeds(true);
+  const byId = new Map(current.map((seed) => [seed.id, seed]));
+  const fingerprintToId = new Map(
+    current.map((seed) => [seed.content.replace(/\s+/g, " ").trim().toLowerCase(), seed.id]),
+  );
+  let added = 0;
+  let merged = 0;
+  let skipped = 0;
+
+  rows.forEach((raw: Partial<MemorySeed>, index: number) => {
+    const content = String(raw?.content || "").trim();
+    if (!content) { skipped += 1; return; }
+    const id = String(raw?.id || `seed-${Date.now()}-${index}`);
+    const incoming: MemorySeed = {
+      id,
+      title: String(raw?.title || "未命名回忆"),
+      content,
+      date: String(raw?.date || ""),
+      tags: uniqueStrings(raw?.tags, 5),
+      importance: Math.max(1, Math.min(5, Number(raw?.importance) || 4)),
+      sourceChronicleIds: uniqueStrings(raw?.sourceChronicleIds, 12),
+      status: raw?.status === "stored" || raw?.status === "ignored" ? raw.status : "pending",
+      createdAt: Number(raw?.createdAt) || Date.now(),
+    };
+    const fingerprint = content.replace(/\s+/g, " ").toLowerCase();
+    const existing = byId.get(id);
+
+    if (!existing) {
+      if (fingerprintToId.has(fingerprint)) { skipped += 1; return; }
+      byId.set(id, incoming);
+      fingerprintToId.set(fingerprint, id);
+      added += 1;
+      return;
+    }
+
+    const mergedStatus = existing.status === "stored" || existing.status === "ignored"
+      ? existing.status
+      : incoming.status;
+    const mergedSeed: MemorySeed = {
+      ...existing,
+      title: existing.title.trim() || incoming.title,
+      content: incoming.content.length > existing.content.length ? incoming.content : existing.content,
+      date: existing.date || incoming.date,
+      tags: uniqueStrings([...existing.tags, ...incoming.tags], 5),
+      importance: Math.max(existing.importance, incoming.importance),
+      sourceChronicleIds: uniqueStrings([...existing.sourceChronicleIds, ...incoming.sourceChronicleIds], 12),
+      status: mergedStatus,
+      createdAt: Math.min(existing.createdAt, incoming.createdAt),
+    };
+    if (JSON.stringify(existing) === JSON.stringify(mergedSeed)) {
+      skipped += 1;
+      return;
+    }
+    byId.set(id, mergedSeed);
+    merged += 1;
+  });
+
+  if (added || merged) saveMemorySeeds(Array.from(byId.values()));
+  return { added, merged, skipped };
 }
 
 export function addMemorySeeds(rows: Array<Omit<MemorySeed, "id" | "status" | "createdAt">>): MemorySeed[] {
