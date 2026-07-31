@@ -22,7 +22,10 @@ export interface WatchRecord {
   duration: number;
   updatedAt: string;
   thumbnailDataUrl?: string;
+  videoFilePath?: string;
+  videoFileName?: string;
   subtitleFileName?: string;
+  subtitleFilePath?: string;
   subtitleCount?: number;
   subtitleOffsetSeconds?: number;
   webUrl?: string;
@@ -208,6 +211,7 @@ export interface CompanionResponse {
   tokenCount?: number;
   thoughts?: string;
   thoughtsTranslated?: string;
+  visionFallbackUsed?: boolean;
 }
 
 export interface LLMAdapter {

@@ -14,7 +14,7 @@
     "electron:icon": "node scripts/create-electron-icon.mjs",
     "electron:dev": "node scripts/electron-dev.mjs",
     "electron:pack": "npm run electron:icon && npm run build && electron-builder --dir",
-    "electron:build": "npm run electron:icon && npm run build && electron-builder --win nsis portable",
+    "electron:build": "npm run electron:icon && npm run build && electron-builder --win portable",
     "test": "vitest run",
     "preview": "vite preview --host 0.0.0.0",
     "preview:pwa": "npm run build && vite preview --host 0.0.0.0",
@@ -40,7 +40,7 @@
   },
   "build": {
     "appId": "com.kisera.kico",
-    "productName": "KI-CO Cottage",
+    "productName": "KI-CO",
     "directories": {
       "output": "release"
     },
@@ -51,8 +51,8 @@
     ],
     "win": {
       "icon": "build/icon.ico",
+      "artifactName": "KI-CO-v${version}.${ext}",
       "target": [
-        "nsis",
         "portable"
       ]
     },

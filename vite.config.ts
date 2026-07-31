@@ -15,6 +15,7 @@ const strictPort = process.env.VITE_STRICT_PORT === "true";
 
 export default defineConfig({
   plugins: [react()],
+  base: "./",
   server: {
     port: 5177,
     strictPort,

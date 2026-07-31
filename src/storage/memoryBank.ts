@@ -1,5 +1,5 @@
 import type { MemoryRetrievalSettings, MemorySnippet, UplinkSettings, VectorProvider } from "../types";
-import { listConversations } from "./conversations";
+import { ensureConversationStoreReady, listConversations } from "./conversations";
 import { listChronicles } from "./chronicles";
 
 export interface LocalRetrievalCandidate {
@@ -275,6 +275,10 @@ const CONTEXT_RETRIEVAL_HISTORY_KEY = "kisera_cottage_context_retrieval_history_
 const CONTEXT_RETRIEVAL_UPDATE_EVENT = "kisera-cottage-context-retrieval-updated";
 const VECTOR_INDEX_KEY = "kisera_cottage_vector_index_v1";
 const OBSIDIAN_DOCS_KEY = "kisera_cottage_obsidian_docs_v1";
+const VECTOR_STORE_DB_NAME = "kisera_cottage_vector_store_v1";
+const VECTOR_STORE_NAME = "kv";
+const VECTOR_STORE_INDEX_ID = "vector_index";
+const VECTOR_STORE_OBSIDIAN_DOCS_ID = "obsidian_docs";
 const OBSIDIAN_INDEX_PREFIX = "obsidian_note:";
 const VECTOR_BUILD_STATUS_KEY = "kisera_cottage_vector_build_status_v1";
 const VECTOR_UPDATE_EVENT = "kisera-cottage-vector-updated";
@@ -856,24 +860,217 @@ function normalizeSourceDoc(raw: Partial<SourceDoc> | null | undefined, index = 
   };
 }
 
+function normalizeVectorIndexRows(value: unknown): VectorIndexEntry[] {
+  const rows = Array.isArray(value) ? value : [];
+  return rows
+    .filter((row: Partial<VectorIndexEntry>) => row && row.id && Array.isArray(row.vector) && row.vector.length > 0)
+    .map((row: Partial<VectorIndexEntry>) => ({
+      id: String(row.id),
+      updatedAt: Number(row.updatedAt) || Date.now(),
+      provider: row.provider === "openai" || row.provider === "gemini" || row.provider === "none" || row.provider === "local"
+        ? row.provider
+        : "local",
+      model: String(row.model || "local-hash-96"),
+      dim: Number(row.dim) || (Array.isArray(row.vector) ? row.vector.length : LOCAL_EMBED_DIM),
+      vector: Array.isArray(row.vector) ? row.vector.map((item) => Number(item) || 0) : [],
+      fingerprint: String(row.fingerprint || ""),
+      sourceType: row.sourceType === "memory-bank" || row.sourceType === "chronicle" || row.sourceType === "latest_style_example" || row.sourceType === "raw_memory"
+        ? row.sourceType
+        : "obsidian_note",
+      sourceId: String(row.sourceId || row.id),
+      parentId: String(row.parentId || row.sourceId || row.id),
+    }));
+}
+
+function normalizeObsidianDocRows(value: unknown): SourceDoc[] {
+  const rows = Array.isArray(value) ? value : [];
+  return rows
+    .map((doc, index) => normalizeSourceDoc(doc, index))
+    .filter((doc): doc is SourceDoc => !!doc && doc.sourceType === "obsidian_note" && !!doc.id && !!doc.content);
+}
+
+function parseLegacyVectorIndex(): VectorIndexEntry[] {
+  return normalizeVectorIndexRows(readJsonArray<VectorIndexEntry>(VECTOR_INDEX_KEY));
+}
+
+function parseLegacyObsidianDocs(): SourceDoc[] {
+  return normalizeObsidianDocRows(readJsonArray<SourceDoc>(OBSIDIAN_DOCS_KEY));
+}
+
+let vectorIndexCache: VectorIndexEntry[] = parseLegacyVectorIndex();
+let obsidianDocsCache: SourceDoc[] = parseLegacyObsidianDocs();
+let persistentVectorStoreLoaded = false;
+let persistentVectorStoreLoading: Promise<void> | null = null;
+let vectorStoreOpenPromise: Promise<IDBDatabase | null> | null = null;
+let vectorStorePersistTimer: ReturnType<typeof setTimeout> | null = null;
+let vectorStorePersistRunning = false;
+let vectorStoreWriteSeq = 0;
+
+function canUseVectorIndexedDB(): boolean {
+  return typeof indexedDB !== "undefined";
+}
+
+function openVectorStore(): Promise<IDBDatabase | null> {
+  if (!canUseVectorIndexedDB()) return Promise.resolve(null);
+  if (vectorStoreOpenPromise) return vectorStoreOpenPromise;
+  vectorStoreOpenPromise = new Promise((resolve) => {
+    try {
+      const request = indexedDB.open(VECTOR_STORE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(VECTOR_STORE_NAME)) {
+          db.createObjectStore(VECTOR_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => {
+        vectorStoreOpenPromise = null;
+        resolve(null);
+      };
+      request.onblocked = () => resolve(null);
+    } catch {
+      vectorStoreOpenPromise = null;
+      resolve(null);
+    }
+  });
+  return vectorStoreOpenPromise;
+}
+
+async function vectorIdbGet<T>(key: string): Promise<T | null> {
+  const db = await openVectorStore();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const transaction = db.transaction(VECTOR_STORE_NAME, "readonly");
+      const request = transaction.objectStore(VECTOR_STORE_NAME).get(key);
+      request.onsuccess = () => resolve((request.result as T) ?? null);
+      request.onerror = () => resolve(null);
+      transaction.onabort = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function vectorIdbSet(key: string, value: unknown): Promise<boolean> {
+  const db = await openVectorStore();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const transaction = db.transaction(VECTOR_STORE_NAME, "readwrite");
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+      transaction.objectStore(VECTOR_STORE_NAME).put(value, key);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+function removeLegacyVectorStorageIfNeeded(): void {
+  try {
+    localStorage.removeItem(VECTOR_INDEX_KEY);
+    localStorage.removeItem(OBSIDIAN_DOCS_KEY);
+  } catch {
+    // Best effort only.
+  }
+}
+
+async function persistVectorCachesToIndexedDB(): Promise<void> {
+  if (vectorStorePersistRunning) return;
+  vectorStorePersistRunning = true;
+  try {
+    const okIndex = await vectorIdbSet(VECTOR_STORE_INDEX_ID, vectorIndexCache);
+    const okDocs = await vectorIdbSet(VECTOR_STORE_OBSIDIAN_DOCS_ID, obsidianDocsCache);
+    if (okIndex && okDocs) {
+      removeLegacyVectorStorageIfNeeded();
+    } else if (!canUseVectorIndexedDB()) {
+      writeJson(VECTOR_INDEX_KEY, vectorIndexCache);
+      writeJson(OBSIDIAN_DOCS_KEY, obsidianDocsCache);
+    }
+  } finally {
+    vectorStorePersistRunning = false;
+  }
+}
+
+function schedulePersistVectorCaches(): void {
+  if (vectorStorePersistTimer) clearTimeout(vectorStorePersistTimer);
+  vectorStorePersistTimer = setTimeout(() => {
+    vectorStorePersistTimer = null;
+    void persistVectorCachesToIndexedDB();
+  }, 80);
+}
+
+async function ensurePersistentVectorStoreReady(): Promise<void> {
+  if (persistentVectorStoreLoaded) return;
+  if (persistentVectorStoreLoading) return persistentVectorStoreLoading;
+  persistentVectorStoreLoading = (async () => {
+    const loadSeq = vectorStoreWriteSeq;
+    const legacyIndex = parseLegacyVectorIndex();
+    const legacyDocs = parseLegacyObsidianDocs();
+    vectorIndexCache = legacyIndex;
+    obsidianDocsCache = legacyDocs;
+
+    const [idbIndex, idbDocs] = await Promise.all([
+      vectorIdbGet<VectorIndexEntry[]>(VECTOR_STORE_INDEX_ID),
+      vectorIdbGet<SourceDoc[]>(VECTOR_STORE_OBSIDIAN_DOCS_ID),
+    ]);
+    const hasIdbIndex = Array.isArray(idbIndex);
+    const hasIdbDocs = Array.isArray(idbDocs);
+
+    if (vectorStoreWriteSeq !== loadSeq) {
+      persistentVectorStoreLoaded = true;
+      return;
+    }
+
+    if (hasIdbIndex) vectorIndexCache = normalizeVectorIndexRows(idbIndex);
+    if (hasIdbDocs) obsidianDocsCache = normalizeObsidianDocRows(idbDocs);
+
+    if ((!hasIdbIndex && legacyIndex.length > 0) || (!hasIdbDocs && legacyDocs.length > 0)) {
+      await persistVectorCachesToIndexedDB();
+    } else if (hasIdbIndex || hasIdbDocs) {
+      removeLegacyVectorStorageIfNeeded();
+    }
+
+    persistentVectorStoreLoaded = true;
+    retrievalCache.clear();
+    dispatchVectorUpdate();
+  })().finally(() => {
+    persistentVectorStoreLoading = null;
+  });
+  return persistentVectorStoreLoading;
+}
+
+void ensurePersistentVectorStoreReady();
+
+export async function ensureVectorStoreReady(): Promise<void> {
+  await ensurePersistentVectorStoreReady();
+}
+
 function listObsidianDocs(): SourceDoc[] {
-  return readJsonArray<SourceDoc>(OBSIDIAN_DOCS_KEY)
+  void ensurePersistentVectorStoreReady();
+  return obsidianDocsCache
     .map((doc, index) => normalizeSourceDoc(doc, index))
     .filter(Boolean) as SourceDoc[];
 }
 
 function saveObsidianDocs(docs: SourceDoc[]): void {
-  writeJson(OBSIDIAN_DOCS_KEY, docs.map((doc, index) => normalizeSourceDoc(doc, index)).filter(Boolean));
+  vectorStoreWriteSeq += 1;
+  obsidianDocsCache = docs.map((doc, index) => normalizeSourceDoc(doc, index)).filter(Boolean) as SourceDoc[];
+  schedulePersistVectorCaches();
   dispatchVectorUpdate();
 }
 
 function listVectorIndex(): VectorIndexEntry[] {
-  return readJsonArray<VectorIndexEntry>(VECTOR_INDEX_KEY)
-    .filter((row) => row && row.id && Array.isArray(row.vector) && row.vector.length > 0);
+  void ensurePersistentVectorStoreReady();
+  return normalizeVectorIndexRows(vectorIndexCache);
 }
 
 function saveVectorIndex(index: VectorIndexEntry[]): void {
-  writeJson(VECTOR_INDEX_KEY, index);
+  vectorStoreWriteSeq += 1;
+  vectorIndexCache = normalizeVectorIndexRows(index);
+  schedulePersistVectorCaches();
   retrievalCache.clear();
   dispatchVectorUpdate();
 }
@@ -915,6 +1112,17 @@ function saveBuildStatus(status: VectorBuildStatus): VectorBuildStatus {
   writeJson(VECTOR_BUILD_STATUS_KEY, status);
   dispatchVectorUpdate();
   return status;
+}
+
+export function markInterruptedVectorBuildStatus(reason = "索引构建已中断，可重新点击重建继续。"): VectorBuildStatus {
+  const current = getBuildStatusFromStore();
+  if (current.state !== "running") return current;
+  return saveBuildStatus({
+    ...current,
+    state: "paused",
+    error: reason,
+    finishedAt: Date.now(),
+  });
 }
 
 function isLatestStyleDoc(doc: SourceDoc, retrieval: MemoryRetrievalSettings): boolean {
@@ -1637,6 +1845,8 @@ function scoreEntry(entry: MemoryEntry, query: string): number {
 
 export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, settings?: UplinkSettings | null): Promise<LocalRetrievalDebugResult> {
   const startedAt = performance.now();
+  await ensureConversationStoreReady();
+  await ensurePersistentVectorStoreReady();
   const entries = listMemoryEntries();
   const docs = buildSourceDocs(settings);
   const retrieval = resolveRetrievalSettings(settings);
@@ -2008,6 +2218,7 @@ export function clearVectorIndex(): VectorBuildStatus {
 }
 
 async function ensureDocsIndexed(settings: UplinkSettings | null | undefined, docs: SourceDoc[]): Promise<{ indexed: number; reused: number }> {
+  await ensurePersistentVectorStoreReady();
   if (!docs.length) return { indexed: 0, reused: 0 };
   const runtime = getEmbeddingRuntimeStatus(settings);
   const provider = runtime.actualProvider;
@@ -2066,6 +2277,7 @@ async function ensureDocsIndexed(settings: UplinkSettings | null | undefined, do
 }
 
 export async function syncObsidianChunks(settings: UplinkSettings | null | undefined, chunks: ObsidianChunkInput[]): Promise<{ docs: number; indexed: number; reused: number }> {
+  await ensurePersistentVectorStoreReady();
   const normalized = (chunks || [])
     .map((chunk, index) => {
       const rawId = normalizeText(chunk.id || chunk.chunkId || `${chunk.noteId || "note"}:${index}`).trim();
@@ -2106,7 +2318,11 @@ export async function syncObsidianChunks(settings: UplinkSettings | null | undef
   return { docs: normalized.length, indexed: report.indexed, reused: report.reused };
 }
 
-export async function rebuildVectorIndex(settings?: UplinkSettings | null): Promise<VectorBuildStatus> {
+export async function rebuildVectorIndex(
+  settings?: UplinkSettings | null,
+  options: { signal?: AbortSignal } = {},
+): Promise<VectorBuildStatus> {
+  await ensurePersistentVectorStoreReady();
   const docs = buildSourceDocs(settings);
   const runtime = getEmbeddingRuntimeStatus(settings);
   const provider = runtime.actualProvider;
@@ -2130,6 +2346,21 @@ export async function rebuildVectorIndex(settings?: UplinkSettings | null): Prom
     let embedded = 0;
     const index: VectorIndexEntry[] = [];
     for (let position = 0; position < docs.length; position += 1) {
+      if (options.signal?.aborted) {
+        return saveBuildStatus({
+          state: "paused",
+          progress: docs.length ? Math.round((position / docs.length) * 100) : 0,
+          processed: position,
+          total: docs.length,
+          embedded,
+          reused,
+          provider,
+          model,
+          startedAt,
+          finishedAt: Date.now(),
+          error: "索引构建已停止，旧索引已保留。",
+        });
+      }
       const doc = docs[position];
       const fingerprint = docFingerprint(doc);
       const existing = previousById.get(doc.id);
@@ -2139,6 +2370,21 @@ export async function rebuildVectorIndex(settings?: UplinkSettings | null): Prom
       } else {
         const text = `${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}\n${doc.content}`;
         const result = await embedText(settings, text, "RETRIEVAL_DOCUMENT");
+        if (options.signal?.aborted) {
+          return saveBuildStatus({
+            state: "paused",
+            progress: docs.length ? Math.round((position / docs.length) * 100) : 0,
+            processed: position,
+            total: docs.length,
+            embedded,
+            reused,
+            provider,
+            model,
+            startedAt,
+            finishedAt: Date.now(),
+            error: "索引构建已停止，旧索引已保留。",
+          });
+        }
         embedded += 1;
         index.push({
           id: doc.id,
@@ -2343,7 +2589,8 @@ export function exportVectorIndexBackup(): VectorIndexBackup {
   };
 }
 
-export function downloadVectorIndexBackup(filename = "kisera_cottage_vector_index.json"): void {
+export async function downloadVectorIndexBackup(filename = "KI-CO_VECTOR_INDEX.json"): Promise<void> {
+  await ensurePersistentVectorStoreReady();
   const payload = exportVectorIndexBackup();
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);

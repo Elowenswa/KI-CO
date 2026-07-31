@@ -4,6 +4,7 @@ import { preserveLocalSecretsForImportedSettings } from "../settings/apiKeyRing"
 import {
   exportConversationRecords,
   hydrateConversationRecords,
+  ensureConversationStoreReady,
   importConversationRecords,
   importConversationRecordsAsync,
   inspectConversationImport,
@@ -12,6 +13,7 @@ import {
   type ConversationImportInspection,
 } from "./conversations";
 import {
+  ensureVectorStoreReady,
   exportVectorIndexBackup,
   importMemoryJson,
   importVectorIndexBackup,
@@ -584,11 +586,16 @@ function normalizeLegacyContinuityLine(value: unknown, activePersonaId: string):
     recentDays: recentDays === 3 || recentDays === 14 ? recentDays : 7,
     sourceChronicleIds: Array.isArray(selected.sourceChronicleIds) ? selected.sourceChronicleIds.map(String).slice(0, 40) : [],
     pinned: Array.isArray(selected.pinned) ? selected.pinned.slice(0, 3) : [],
+    generatedAt: Number(selected.generatedAt) || undefined,
+    coverageStart: String(selected.coverageStart || "").trim() || undefined,
+    coverageEnd: String(selected.coverageEnd || "").trim() || undefined,
     updatedAt: Number(selected.updatedAt) || Date.now(),
   };
 }
 
 export async function createFullBackup(settings: UplinkSettings, personaProfile: PersonaProfile): Promise<CottageFullBackup> {
+  await ensureConversationStoreReady();
+  await ensureVectorStoreReady();
   return {
     meta: {
       schema: FULL_SCHEMA,
@@ -623,7 +630,8 @@ export function createSettingsBackup(settings: UplinkSettings, personaProfile: P
   };
 }
 
-export function createTravelPack(settings: UplinkSettings, personaProfile: PersonaProfile): CottageTravelPack {
+export async function createTravelPack(settings: UplinkSettings, personaProfile: PersonaProfile): Promise<CottageTravelPack> {
+  await ensureConversationStoreReady();
   const conversations = selectTravelConversations();
   const conversationIds = new Set(conversations.map((conversation) => conversation.id));
   const memories = listMemoryEntries();

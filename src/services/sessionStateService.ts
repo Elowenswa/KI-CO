@@ -246,23 +246,38 @@ function normalizeLastCoveredCount(lastMessageCount: number, currentCount: numbe
   return Math.min(raw, sealedCount);
 }
 
+function initialStateCardThreshold(historyDepth: number): number {
+  const depth = normalizeHistoryDepth(historyDepth);
+  return Math.max(2, Math.min(6, Math.round(depth * 0.4)));
+}
+
+function stateCardUpdateThreshold(historyDepth: number): number {
+  const depth = normalizeHistoryDepth(historyDepth);
+  return Math.max(8, Math.min(24, Math.round(depth * 1.2)));
+}
+
+function topicShiftUpdateThreshold(historyDepth: number): number {
+  const depth = normalizeHistoryDepth(historyDepth);
+  return Math.max(4, Math.min(12, Math.round(depth * 0.6)));
+}
+
 function shouldUpdate(card: SessionStateCard, messages: ConversationMessage[], latestUserText: string, historyDepth: number, force: boolean): boolean {
   if (force) return true;
   if (!card.enabled) return false;
   const count = conversationMessages(messages).length;
   if (count < 4) return false;
   const sealedCount = sealedMessageCount(messages, historyDepth);
-  if (!card.content.trim()) return sealedCount >= 2;
+  if (!card.content.trim()) return sealedCount >= initialStateCardThreshold(historyDepth);
   const coveredCount = normalizeLastCoveredCount(card.lastMessageCount, count, historyDepth);
   const delta = sealedCount - coveredCount;
   const depth = normalizeHistoryDepth(historyDepth);
-  const threshold = Math.max(6, Math.min(14, Math.round(depth * 0.8)));
+  const threshold = stateCardUpdateThreshold(depth);
   if (delta >= threshold) return true;
   const recentWindowSize = Math.min(depth, count);
   const oldestRecentMessageTurnId = count > 0 ? Math.max(1, count - recentWindowSize + 1) : 0;
-  const coverageGapSafety = Math.max(4, Math.floor(depth * 0.5));
-  if (oldestRecentMessageTurnId > coveredCount + coverageGapSafety) return true;
-  return delta >= 2 && TOPIC_SHIFT_PATTERNS.some((pattern) => latestUserText.includes(pattern));
+  const coverageGapSafety = Math.max(threshold, Math.floor(depth * 0.9));
+  if (oldestRecentMessageTurnId > coveredCount + coverageGapSafety && delta >= threshold) return true;
+  return delta >= topicShiftUpdateThreshold(depth) && TOPIC_SHIFT_PATTERNS.some((pattern) => latestUserText.includes(pattern));
 }
 
 export async function updateSessionStateCard(

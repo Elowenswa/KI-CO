@@ -193,7 +193,7 @@ export const DEFAULT_UPLINK_SETTINGS: UplinkSettings = {
   profiles: DEFAULT_PROFILES,
   contextLoad: {
     maxOutputTokens: 1200,
-    shortTermMessageLimit: 15,
+    shortTermMessageLimit: 10,
     memorySnippetLimit: 4,
     timeAwarenessMode: "date_only",
     subtitleBefore: 10,

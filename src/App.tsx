@@ -154,7 +154,7 @@ export default function App() {
       void (async () => {
         const dateLabel = new Date().toISOString().slice(0, 10);
         downloadBackup(
-          `KISERA_COTTAGE_FULL_BACKUP_${dateLabel}.json`,
+          `KI-CO_FULL_${dateLabel}.json`,
           await createFullBackup(uplinkSettings, personaProfile),
           "auto-reminder",
         );

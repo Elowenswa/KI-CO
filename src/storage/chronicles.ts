@@ -49,6 +49,9 @@ export interface ContinuityLine {
   recentDays: 3 | 7 | 14;
   sourceChronicleIds: string[];
   pinned: Array<{ id: string; content: string; createdAt: number }>;
+  generatedAt?: number;
+  coverageStart?: string;
+  coverageEnd?: string;
   updatedAt: number;
 }
 
@@ -321,6 +324,9 @@ export function getContinuityLine(): ContinuityLine {
       recentDays: raw.recentDays === 3 || raw.recentDays === 14 ? raw.recentDays : 7,
       sourceChronicleIds: uniqueStrings(raw.sourceChronicleIds, 40),
       pinned: Array.isArray(raw.pinned) ? raw.pinned.slice(0, 3) : [],
+      generatedAt: Number(raw.generatedAt) || undefined,
+      coverageStart: String(raw.coverageStart || "").trim() || undefined,
+      coverageEnd: String(raw.coverageEnd || "").trim() || undefined,
       updatedAt: Number(raw.updatedAt) || 0,
     };
   } catch {

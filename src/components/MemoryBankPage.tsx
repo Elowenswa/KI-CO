@@ -339,7 +339,7 @@ export function MemoryBankPage({ settings }: MemoryBankPageProps) {
                   </div>
                 )}
               </div>
-              <button type="button" onClick={() => downloadText(`persona_memory_bank_${new Date().toISOString().slice(0, 10)}.json`, exportMemoryJson())}>
+              <button type="button" onClick={() => downloadText(`KI-CO_MEMORY_${new Date().toISOString().slice(0, 10)}.json`, exportMemoryJson())}>
                 <Download size={15} />
                 备份
               </button>

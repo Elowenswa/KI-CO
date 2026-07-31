@@ -3,6 +3,10 @@ import { slugifyTitle } from "../utils/time";
 import { imageDB } from "../utils/imageDB";
 
 const STORAGE_KEY = "kisera_cinema_conversations_v1";
+const CONVERSATION_STORE_DB_NAME = "kisera_cottage_conversation_store_v1";
+const CONVERSATION_STORE_NAME = "kv";
+const CONVERSATION_STORE_LIST_ID = "conversations";
+const CONVERSATION_UPDATE_EVENT = "kisera-cottage-conversations-updated";
 const MAX_STORED_CONVERSATIONS = 120;
 
 export type ConversationImportConflictMode = "merge" | "copy";
@@ -209,8 +213,9 @@ export async function hydrateConversationRecords(conversations: ConversationReco
   return Promise.all(normalizeConversationList(conversations).map(hydrateConversation));
 }
 
-function readConversations(): ConversationRecord[] {
+function readLegacyConversations(): ConversationRecord[] {
   try {
+    if (typeof localStorage === "undefined") return [];
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
@@ -220,10 +225,175 @@ function readConversations(): ConversationRecord[] {
   }
 }
 
+let conversationCache: ConversationRecord[] = readLegacyConversations();
+let persistentConversationStoreLoaded = false;
+let persistentConversationStoreLoading: Promise<void> | null = null;
+let conversationStoreOpenPromise: Promise<IDBDatabase | null> | null = null;
+let conversationStorePersistRunning = false;
+let conversationStorePersistQueued = false;
+let conversationStoreWriteSeq = 0;
+
+function canUseConversationIndexedDB(): boolean {
+  return typeof indexedDB !== "undefined";
+}
+
+function dispatchConversationUpdate(): void {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(CONVERSATION_UPDATE_EVENT));
+  }
+}
+
+function openConversationStore(): Promise<IDBDatabase | null> {
+  if (!canUseConversationIndexedDB()) return Promise.resolve(null);
+  if (conversationStoreOpenPromise) return conversationStoreOpenPromise;
+  conversationStoreOpenPromise = new Promise((resolve) => {
+    try {
+      const request = indexedDB.open(CONVERSATION_STORE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(CONVERSATION_STORE_NAME)) {
+          db.createObjectStore(CONVERSATION_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => {
+        conversationStoreOpenPromise = null;
+        resolve(null);
+      };
+      request.onblocked = () => resolve(null);
+    } catch {
+      conversationStoreOpenPromise = null;
+      resolve(null);
+    }
+  });
+  return conversationStoreOpenPromise;
+}
+
+async function conversationIdbGet<T>(key: string): Promise<T | null> {
+  const db = await openConversationStore();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const transaction = db.transaction(CONVERSATION_STORE_NAME, "readonly");
+      const request = transaction.objectStore(CONVERSATION_STORE_NAME).get(key);
+      request.onsuccess = () => resolve((request.result as T) ?? null);
+      request.onerror = () => resolve(null);
+      transaction.onabort = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function conversationIdbSet(key: string, value: unknown): Promise<boolean> {
+  const db = await openConversationStore();
+  if (!db) return false;
+  return new Promise((resolve) => {
+    try {
+      const transaction = db.transaction(CONVERSATION_STORE_NAME, "readwrite");
+      transaction.oncomplete = () => resolve(true);
+      transaction.onerror = () => resolve(false);
+      transaction.onabort = () => resolve(false);
+      transaction.objectStore(CONVERSATION_STORE_NAME).put(value, key);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+function removeLegacyConversationStorageIfNeeded(): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Best effort only.
+  }
+}
+
+async function persistConversationCacheToIndexedDB(): Promise<void> {
+  if (conversationStorePersistRunning) {
+    conversationStorePersistQueued = true;
+    return;
+  }
+  conversationStorePersistRunning = true;
+  try {
+    const snapshot = normalizeConversationList(conversationCache);
+    const ok = await conversationIdbSet(CONVERSATION_STORE_LIST_ID, snapshot);
+    if (ok) {
+      removeLegacyConversationStorageIfNeeded();
+    } else {
+      try {
+        if (typeof localStorage !== "undefined") {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+        }
+      } catch (error) {
+        console.warn("[Conversations] Failed to persist fallback localStorage copy:", error);
+      }
+    }
+  } finally {
+    conversationStorePersistRunning = false;
+    if (conversationStorePersistQueued) {
+      conversationStorePersistQueued = false;
+      void persistConversationCacheToIndexedDB();
+    }
+  }
+}
+
+export async function ensureConversationStoreReady(): Promise<void> {
+  if (persistentConversationStoreLoaded) return;
+  if (persistentConversationStoreLoading) return persistentConversationStoreLoading;
+  persistentConversationStoreLoading = (async () => {
+    const loadSeq = conversationStoreWriteSeq;
+    const legacy = readLegacyConversations();
+    conversationCache = legacy;
+    const idbConversations = await conversationIdbGet<ConversationRecord[]>(CONVERSATION_STORE_LIST_ID);
+
+    if (conversationStoreWriteSeq !== loadSeq) {
+      persistentConversationStoreLoaded = true;
+      return;
+    }
+
+    if (Array.isArray(idbConversations)) {
+      conversationCache = normalizeConversationList(idbConversations as ConversationRecord[]);
+      removeLegacyConversationStorageIfNeeded();
+    } else if (legacy.length > 0) {
+      conversationCache = legacy;
+      await persistConversationCacheToIndexedDB();
+    }
+
+    persistentConversationStoreLoaded = true;
+    dispatchConversationUpdate();
+  })().finally(() => {
+    persistentConversationStoreLoading = null;
+  });
+  return persistentConversationStoreLoading;
+}
+
+void ensureConversationStoreReady();
+
+export function subscribeConversationStore(listener: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  const handler = () => listener();
+  window.addEventListener(CONVERSATION_UPDATE_EVENT, handler);
+  return () => window.removeEventListener(CONVERSATION_UPDATE_EVENT, handler);
+}
+
+function readConversations(): ConversationRecord[] {
+  void ensureConversationStoreReady();
+  return normalizeConversationList(conversationCache);
+}
+
 function writeConversations(conversations: ConversationRecord[]) {
   const normalized = normalizeConversationList(conversations);
+  conversationStoreWriteSeq += 1;
+  conversationCache = normalized;
+  if (canUseConversationIndexedDB()) {
+    void persistConversationCacheToIndexedDB();
+    dispatchConversationUpdate();
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    dispatchConversationUpdate();
     return;
   } catch (error) {
     if (!isQuotaExceeded(error)) throw error;
@@ -360,6 +530,7 @@ export async function importConversationRecordsAsync(
   incoming: ConversationRecord[],
   conflictMode: ConversationImportConflictMode = "merge",
 ): Promise<ConversationImportReport> {
+  await ensureConversationStoreReady();
   const prepared = await prepareConversationRecordsForStorage(incoming);
   return importConversationRecords(prepared, conflictMode);
 }

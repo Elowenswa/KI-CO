@@ -6,6 +6,7 @@ import {
   getContinuityLine,
   getChroniclePreferences,
   listChronicles,
+  listMemorySeeds,
   saveContinuityLine,
   type ChronicleEntry,
   type MemorySeed,
@@ -15,6 +16,14 @@ const CURSOR_KEY = "kisera_cottage_chronicle_cursor_v1";
 const PENDING_RETRY_KEY = "kisera_cottage_chronicle_pending_retry_v1";
 
 type ChronicleWriteIntent = "auto" | "manual";
+
+export interface MemorySeedGenerationResult {
+  pendingSeeds: MemorySeed[];
+  parsed: boolean;
+  candidateCount: number;
+  validCandidateCount: number;
+  acceptedCount: number;
+}
 
 const MANUAL_CHRONICLE_TRIGGER_PHRASES = [
   "请写入记忆之页",
@@ -49,6 +58,15 @@ const MANUAL_CHRONICLE_TRIGGER_PATTERNS = [
 
 function emptyWatchContext() {
   return { title: "", currentTime: 0, duration: 0, sourceType: "local-file" as const, subtitleWindow: { previous: [], next: [] } };
+}
+
+function formatDateKey(value: number | Date): string {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function readCursorMap(): Record<string, number> {
@@ -213,6 +231,54 @@ async function callJournalModel(llm: LLMAdapter, profile: PersonaProfile, instru
   return response.text.trim();
 }
 
+const CONTINUITY_RELATIVE_TIME_RISK_PATTERN = /(今天|昨天|明天|刚才|今晚|现在|最近|这两天|前几天|上次)/;
+
+function continuityCoverage(entries: ChronicleEntry[]) {
+  const times = entries
+    .map((entry) => Number(entry.createdAt))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const now = Date.now();
+  const start = times.length ? Math.min(...times) : now;
+  const end = times.length ? Math.max(...times) : now;
+  return {
+    generatedAt: now,
+    coverageStart: formatDateKey(start),
+    coverageEnd: formatDateKey(end),
+  };
+}
+
+async function rewriteContinuityTimeWordsIfNeeded(
+  llm: LLMAdapter,
+  profile: PersonaProfile,
+  content: string,
+  coverageStart: string,
+  coverageEnd: string,
+): Promise<string> {
+  const source = content.trim();
+  if (!source || !CONTINUITY_RELATIVE_TIME_RISK_PATTERN.test(source)) return source;
+  const rewritten = await callJournalModel(llm, profile, `
+请在不改变事实、不扩写、不升华的前提下，轻量改写下面这段“近期生活线”。
+
+目标：把容易随当前日期误读的相对时间词，改成明确日期、日期范围或唯一事件锚点。
+
+素材覆盖：${coverageStart} 至 ${coverageEnd}
+
+优先使用：
+- 具体日期或时间范围，例如 2026年7月24日、7月下旬、${coverageStart} 至 ${coverageEnd}
+- 明确且唯一的事件锚点，例如 旅行期间、某次导入备份后
+- 事件表达若可能产生歧义，需要同时附带日期
+
+避免单独使用：
+今天、昨天、明天、刚才、今晚、现在、最近、这两天、前几天、上次
+
+只输出改写后的生活线正文，不要解释。
+
+[原生活线]
+${source}
+`, "chronicle:continuity-time-rewrite");
+  return rewritten.trim() || source;
+}
+
 function conversationMaterial(conversation: ConversationRecord, profile: PersonaProfile, persona: PersonaCard, maxMessages = 40): string {
   const userName = profile.userName || "User";
   const personaName = persona?.name || "Persona";
@@ -341,8 +407,23 @@ export function getContinuityContext(userName = "User"): string {
   const line = getContinuityLine();
   const fragments = [line.content.trim(), ...line.pinned.map((item) => `置顶：${item.content.trim()}`)].filter(Boolean);
   if (!fragments.length) return "";
+  const generatedAt = line.generatedAt || line.updatedAt || 0;
+  const generatedDate = generatedAt ? formatDateKey(generatedAt) : "未知";
+  const coverage = line.coverageStart && line.coverageEnd
+    ? `${line.coverageStart} 至 ${line.coverageEnd}`
+    : `最近 ${line.recentDays} 天（旧生活线未保存精确覆盖日期）`;
   return [
-    `这是${userName || "User"}最近几天的生活片段，知道就好，不用念出来；如果现在聊的不是这些，就让它安静待在背景里，不用硬凑话题。`,
+    `【生活线时间边界】
+生成时间：${generatedDate}
+素材覆盖：${coverage}
+
+以下内容是上述时间段内形成的背景记录，不代表当前正在发生。
+其中若残留“今天、最近、刚才”等相对时间词，均指素材当时的语境。
+当前日期、时间和事件距今多久，以 Time Bridge 为准。
+若生活线与${userName || "User"}当下表达冲突，以${userName || "User"}当下的表达为准。
+优先级：${userName || "User"}当下明确表达 ＞ Time Bridge ＞ 生活线 / 长期记忆里的旧时间描述。
+
+【生活线正文】`,
     fragments.join("\n"),
   ].join("\n\n");
 }
@@ -391,12 +472,13 @@ export async function generateContinuityFromChronicles(
   const userName = profile.userName || "User";
   const personaName = persona?.name || "Persona";
   const personaCore = String(persona?.systemPrompt || "").trim().slice(0, 3000);
+  const coverage = continuityCoverage(entries);
   const material = entries
     .sort((a, b) => a.createdAt - b.createdAt)
     .map((entry) => `[${entry.dateRange}｜${entry.title}｜id=${entry.id}]\n${entry.content}`)
     .join("\n\n")
     .slice(0, 50000);
-  const content = await callJournalModel(llm, profile, `
+  let content = await callJournalModel(llm, profile, `
 看一看最近几天的日记和对话，写一段轻的、近况式的话——像留给明天的自己一张便利贴，不是写报告。只说现在正在发生什么，别评价，别升华，别下结论。控制在 300-700 字。
 
 请阅读最近几天的日记和对话，为 ${userName} 与 ${personaName} 提炼一张“近期生活线”。
@@ -412,6 +494,10 @@ export async function generateContinuityFromChronicles(
 [写作要求]
 
 控制在 300-700 个中文字符；素材很少时可以更短，不要凑字数。
+时间表达采用正向规范：优先使用具体日期或时间范围，例如 ${coverage.coverageStart}、${coverage.coverageStart} 至 ${coverage.coverageEnd}、7月下旬。
+也可以使用明确且唯一的事件锚点，例如旅行期间、那次 Electron 缓存丢失后；事件表达若可能产生歧义，需要同时附带日期。
+避免单独使用：今天、昨天、明天、刚才、今晚、现在、最近、这两天、前几天、上次。
+生活线只提供过去一段时间的背景，不代表当前正在发生；当前时间解释权属于 Time Bridge 和 ${userName} 当下表达。
 只保留仍在发生、近期反复提到、尚未结束，或接下来很可能继续的话题。
 已结束且不再影响当下的细节，可以自然放下。
 不要把每篇日记逐篇复述，不要写流水账。
@@ -428,7 +514,15 @@ ${personaCore || "保持自然、准确、真实。"}
 [日记素材]
 ${material}
 `, "chronicle:continuity");
-  saveContinuityLine({ content, recentDays, sourceChronicleIds: entries.map((entry) => entry.id) });
+  content = await rewriteContinuityTimeWordsIfNeeded(llm, profile, content, coverage.coverageStart, coverage.coverageEnd);
+  saveContinuityLine({
+    content,
+    recentDays,
+    sourceChronicleIds: entries.map((entry) => entry.id),
+    generatedAt: coverage.generatedAt,
+    coverageStart: coverage.coverageStart,
+    coverageEnd: coverage.coverageEnd,
+  });
   return content;
 }
 
@@ -436,8 +530,10 @@ export async function generateMemorySeeds(
   llm: LLMAdapter,
   profile: PersonaProfile,
   entries: ChronicleEntry[],
-): Promise<MemorySeed[]> {
-  if (!entries.length) return [];
+): Promise<MemorySeedGenerationResult> {
+  if (!entries.length) {
+    return { pendingSeeds: [], parsed: true, candidateCount: 0, validCandidateCount: 0, acceptedCount: 0 };
+  }
   const persona = activePersona(profile);
   const userName = profile.userName || "User";
   const personaName = persona?.name || "Persona";
@@ -447,29 +543,36 @@ export async function generateMemorySeeds(
     .map((entry) => `[${entry.dateRange}｜${entry.title}｜id=${entry.id}]\n${entry.content}`)
     .join("\n\n")
     .slice(0, 70000);
+  const maxCoreCandidates = entries.length <= 2 ? 1 : entries.length <= 8 ? 2 : 3;
   const result = await callJournalModel(llm, profile, `
-回顾这段时间里发生的事，挑出真正值得作为候选留下的内容——不是流水账，而是很久以后仍可能需要回看的核心片段。写清楚是什么、和谁、为什么重要、有没有什么变了。这是候选，不是定论，最终要不要留下，由 ${userName} 决定。
+请把以下日记素材整理成“核心回忆候选”。它更像是本月回忆的整理台：先帮 ${userName} 把可能值得留下的内容挑出来，再由 ${userName} 决定是否存入记忆库。
 
-请阅读以下日记素材，完成“回忆提炼”。这不是自动写入长期记忆，而是生成等待用户确认的 Memory Seeds。
-请让 ${personaName} 依据自己的人格核、日记素材与当前事实，判断哪些内容值得作为候选留下；但不要替 ${userName} 做最终决定。
+这不是自动写入长期记忆，也不是替 ${userName} 下定论。请让 ${personaName} 依据自己的人格核、日记素材与当前事实，自然判断哪些内容适合成为候选。
 
 [任务]
-只提取真正值得长期保存的核心事件、成长节点、关系变化、明确偏好、重要约定或项目里程碑；普通日常不要硬升格。
-输出 1-5 条，确实没有可只输出空数组。
+先通读全部日记，找出跨日记反复出现的主题、状态变化、关系变化、项目进展或阶段性节点，不要逐篇摘要。
+通常整理 1 条核心回忆候选；如果没有新增的核心变化、长期影响或值得回看的内容，可以输出空数组。
+如果素材里确实有多个彼此独立且都有长期价值的主题，最多输出 ${maxCoreCandidates} 条。
+数量由独立主题和长期价值决定；日记篇数只作为上限保护，不作为生成依据。
+候选可以是核心事件、成长节点、关系变化、明确偏好、重要约定、项目里程碑，或很久以后仍可能想起的一段经历。
+普通日常不要硬升格，但如果它体现了持续偏好、当月状态、关系温度、创作/协作进展，也可以合并整理成候选。
+请优先合并同类内容。不要让每篇日记各生成一条候选；覆盖多篇日记是优先项，不是硬条件。某一篇本身就是明确关键事件、重要决定、健康/生活/关系转折或项目里程碑时，可以独立成条。
 
 [每条 seed]
 - title：自然短标题。
-- content：脱离原日记仍能理解的完整事实，40-180 字。
+- content：脱离原日记仍能理解的完整核心记忆，说明发生了什么、形成了什么变化、以后为什么值得记得。通常约 200-600 字；素材很少时可以更短，复杂阶段可以略长。不要为了凑长度重复或升华，也不要写成一句话标签。
 - date：YYYY-MM-DD；无法精确时使用素材中的日期范围。
 - tags：1-5 个标签。
 - importance：1-5。
-- sourceChronicleIds：只能填写素材中真实存在的 id。
+- sourceChronicleIds：只能填写素材中真实存在的 id；如果候选来自多篇日记，请尽量填写多篇来源 id。
 
 [边界]
 - 不编造，没有发生就不写。
 - 不把技术协作强行情感升华。
 - 不把一句玩笑误判成永久承诺。
 - 不替 ${userName} 决定是否写入长期记忆。
+- 不要过早替 ${userName} 判定“不重要”；只要可能值得回看，就可以作为候选交给用户确认。
+- 不要把仍在持续更新的普通生活状态重复写成核心记忆；只有当生活线发生明确转折、形成稳定偏好或产生长期影响时，才提炼。
 - 不输出解释，只输出 JSON。
 
 [${personaName} 人格核]
@@ -483,9 +586,10 @@ ${material}
 `, "chronicle:seeds");
   const parsed = stripJsonFence(result);
   const validIds = new Set(entries.map((entry) => entry.id));
-  const rows = (Array.isArray(parsed?.seeds) ? parsed.seeds : []).map((seed: any) => ({
+  const rawSeeds = Array.isArray(parsed?.seeds) ? parsed.seeds : [];
+  const validRows = rawSeeds.map((seed: any) => ({
     title: String(seed?.title || "未命名回忆").trim().slice(0, 80),
-    content: String(seed?.content || "").trim().slice(0, 700),
+    content: String(seed?.content || "").trim().slice(0, 1200),
     date: String(seed?.date || "").trim().slice(0, 30),
     tags: Array.isArray(seed?.tags) ? seed.tags.map(String).filter(Boolean).slice(0, 5) : [],
     importance: Math.max(1, Math.min(5, Number(seed?.importance) || 4)),
@@ -493,7 +597,23 @@ ${material}
       ? seed.sourceChronicleIds.map(String).filter((id: string) => validIds.has(id)).slice(0, 8)
       : [],
   })).filter((seed: any) => seed.content.length >= 12);
-  return addMemorySeeds(rows);
+  const rows = [...validRows]
+    .sort((left, right) => (
+      right.importance - left.importance
+      || right.sourceChronicleIds.length - left.sourceChronicleIds.length
+      || right.content.length - left.content.length
+    ))
+    .slice(0, maxCoreCandidates);
+  const beforeIds = new Set(listMemorySeeds(true).map((seed) => seed.id));
+  const pendingSeeds = addMemorySeeds(rows);
+  const acceptedCount = listMemorySeeds(true).filter((seed) => !beforeIds.has(seed.id)).length;
+  return {
+    pendingSeeds,
+    parsed: Boolean(parsed && typeof parsed === "object"),
+    candidateCount: rawSeeds.length,
+    validCandidateCount: validRows.length,
+    acceptedCount,
+  };
 }
 
 export function recentChronicles(days: 3 | 7 | 14): ChronicleEntry[] {

@@ -37,6 +37,7 @@ import type { AvatarPosition, PersonaProfile } from "../../storage/personaProfil
 import {
   createConversation,
   deleteConversation,
+  ensureConversationStoreReady,
   getConversation,
   hydrateConversationRecords,
   importConversationRecordsAsync,
@@ -45,6 +46,7 @@ import {
   normalizeConversationRecord,
   renameConversation,
   replaceConversationMessages,
+  subscribeConversationStore,
 } from "../../storage/conversations";
 import { selectCacheFriendlyWindow } from "../../utils/contextWindow";
 import { shouldRetrieveMemory } from "../../utils/memoryRecallGate";
@@ -487,6 +489,15 @@ function estimateMessageTokens(message: Pick<ConversationMessage, "text" | "atta
   return Math.max(1, Math.ceil((message.text || "").length / 3) + attachmentTokens);
 }
 
+function describeConversationPersistError(event: unknown) {
+  const rawMessage = event instanceof Error ? event.message : String(event || "");
+  const normalized = rawMessage.toLowerCase();
+  if (normalized.includes("quota") || normalized.includes("storage") || rawMessage.includes("存储空间不足")) {
+    return "浏览器本地存储空间不足，消息没有保存成功。请先导出备份，清理一些旧窗口或大附件后再试。";
+  }
+  return rawMessage || "浏览器没有保存成功，请稍后重试。";
+}
+
 function getConversationSortTime(conversation: ConversationRecord) {
   const createdAt = new Date(conversation.createdAt).getTime();
   if (Number.isFinite(createdAt)) return createdAt;
@@ -521,7 +532,7 @@ export function ChatPage({
     || personaProfile?.personas[0];
   const [conversations, setConversations] = useState<ConversationRecord[]>(() => {
     const stored = listConversations();
-    return stored.length ? stored : [createConversation("新的对话")];
+    return stored.length ? stored : [];
   });
   const [activeId, setActiveId] = useState(() => initialConversationId || readActiveConversationId(conversations) || conversations[0]?.id || "");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -707,10 +718,51 @@ export function ChatPage({
   const visibleMessages = hiddenMessageCount > 0 ? messages.slice(hiddenMessageCount) : messages;
 
   useEffect(() => {
+    let cancelled = false;
+    const refreshFromStore = () => {
+      const stored = listConversations();
+      if (cancelled) return;
+      setConversations(stored);
+      setActiveId((current) => {
+        if (current && stored.some((conversation) => conversation.id === current)) return current;
+        return readActiveConversationId(stored) || stored[0]?.id || "";
+      });
+    };
+
+    const unsubscribe = subscribeConversationStore(refreshFromStore);
+    void ensureConversationStoreReady().then(() => {
+      if (cancelled) return;
+      let stored = listConversations();
+      let targetId = initialConversationId && stored.some((conversation) => conversation.id === initialConversationId)
+        ? initialConversationId
+        : readActiveConversationId(stored) || stored[0]?.id || "";
+      if (!stored.length) {
+        const created = createConversation("新的对话");
+        stored = listConversations();
+        targetId = created.id;
+      }
+      setConversations(stored);
+      setActiveId(targetId);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!initialConversationId) return;
-    setActiveId(initialConversationId);
-    setInput(draftByConversationRef.current[initialConversationId] ?? readConversationDraft(initialConversationId));
-    setConversations(listConversations());
+    let cancelled = false;
+    void ensureConversationStoreReady().then(() => {
+      if (cancelled) return;
+      setActiveId(initialConversationId);
+      setInput(draftByConversationRef.current[initialConversationId] ?? readConversationDraft(initialConversationId));
+      setConversations(listConversations());
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [initialConversationId]);
 
   useEffect(() => {
@@ -1043,7 +1095,7 @@ export function ChatPage({
     const link = document.createElement("a");
     const safeTitle = (activeConversation.title || "conversation").replace(/[\\/:*?"<>|]+/g, "-").slice(0, 60);
     link.href = url;
-    link.download = `ki-co-chat-${safeTitle}-${new Date().toISOString().slice(0, 10)}.json`;
+    link.download = `KI-CO_CHAT_${safeTitle}_${new Date().toISOString().slice(0, 10)}.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -1073,6 +1125,7 @@ export function ChatPage({
         .map((item, index) => normalizeConversationRecord(item, index))
         .filter(Boolean) as ConversationRecord[];
       if (!incoming.length) throw new Error("文件里没有可识别的对话窗口。");
+      await ensureConversationStoreReady();
       const inspection = inspectConversationImport(incoming);
       let conflictMode: "merge" | "copy" = "copy";
       if (inspection.divergentSameId > 0) {
@@ -1669,7 +1722,35 @@ ${currentStateCard.content.trim()}`
     const conversationId = activeConversation.id;
     const baseMessages = [...historyPrefix, userMessage];
     const optimisticMessages = [...baseMessages, companionMessage];
-    replaceConversationMessages(conversationId, optimisticMessages);
+    let persistenceWarningShown = false;
+    const persistMessagesSafely = (
+      nextMessages: ConversationMessage[],
+      options: { previewOnError?: boolean; reportError?: boolean } = {},
+    ) => {
+      const previewOnError = options.previewOnError !== false;
+      const reportError = options.reportError !== false;
+      try {
+        replaceConversationMessages(conversationId, nextMessages);
+        return true;
+      } catch (event) {
+        console.warn("[Chat] Failed to persist conversation messages:", event);
+        if (previewOnError) previewConversationMessages(conversationId, nextMessages);
+        if (reportError && !persistenceWarningShown) {
+          persistenceWarningShown = true;
+          setError(describeConversationPersistError(event));
+        }
+        return false;
+      }
+    };
+    if (!persistMessagesSafely(optimisticMessages, { previewOnError: false, reportError: true })) {
+      if (restoreDraftOnError) {
+        setInput(rawText);
+        setPendingAttachments(attachments);
+        persistConversationDraft(conversationId, rawText);
+      }
+      setIsSending(false);
+      return;
+    }
     refresh(conversationId);
 
     let latestStreamedText = "";
@@ -1697,7 +1778,7 @@ ${currentStateCard.content.trim()}`
       const write = () => {
         if (streamPersistenceFinalized) return;
         lastStreamPersistAt = Date.now();
-        replaceConversationMessages(conversationId, [
+        persistMessagesSafely([
           ...baseMessages,
           buildCompanionSnapshot(trimmed),
         ]);
@@ -1751,6 +1832,9 @@ ${currentStateCard.content.trim()}`
         key: `${conversationId}:${userMessage.id}`,
         reuse: reuseGenerationContext,
       });
+      if (response.visionFallbackUsed) {
+        setError("当前模型或接口不支持识图，已改用文字和附件名继续。");
+      }
       const completedMessages = [
         ...baseMessages,
         {
@@ -1761,8 +1845,9 @@ ${currentStateCard.content.trim()}`
       ];
       clearPendingStreamPreview();
       finishStreamPersistence();
-      replaceConversationMessages(conversationId, completedMessages);
-      refresh(conversationId);
+      if (persistMessagesSafely(completedMessages)) {
+        refresh(conversationId);
+      }
       markWindowHandoffUsed(conversationId);
       if (personaProfile) {
         const completedConversation: ConversationRecord = {
@@ -1799,7 +1884,7 @@ ${currentStateCard.content.trim()}`
       clearPendingStreamPreview();
       finishStreamPersistence();
       if (aborted) {
-        replaceConversationMessages(conversationId, [
+        persistMessagesSafely([
           ...baseMessages,
           {
             ...companionMessage,
@@ -1809,7 +1894,7 @@ ${currentStateCard.content.trim()}`
           },
         ]);
       } else if (latestStreamedText.trim()) {
-        replaceConversationMessages(conversationId, [
+        persistMessagesSafely([
           ...baseMessages,
           {
             ...companionMessage,
@@ -1822,7 +1907,7 @@ ${currentStateCard.content.trim()}`
         const errorText = event instanceof Error
           ? `连接中断：${event.message}`
           : "连接中断：对话请求失败。";
-        replaceConversationMessages(conversationId, [
+        persistMessagesSafely([
           ...baseMessages,
           buildCompanionSnapshot(errorText),
         ]);

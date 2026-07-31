@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
+  Check,
   Clapperboard,
   Clock3,
+  Copy,
+  Edit2,
   ExternalLink,
   Film,
   Heart,
@@ -31,7 +34,7 @@ import { shouldRetrieveMemory } from "../utils/memoryRecallGate";
 import { formatTime, slugifyTitle } from "../utils/time";
 import { buildTimeAwarenessContext } from "../utils/timeAwareness";
 import { listWatchRecords, removeWatchRecord, renameWatchRecord, saveWatchRecord } from "../storage/watchRecords";
-import { appendConversationMessages, findWatchConversation, getOrCreateWatchConversation, renameWatchConversationLink } from "../storage/conversations";
+import { appendConversationMessages, ensureConversationStoreReady, findWatchConversation, getOrCreateWatchConversation, renameWatchConversationLink } from "../storage/conversations";
 import { MarkdownText } from "./MarkdownText";
 
 interface CinemaCompanionRoomProps {
@@ -133,13 +136,16 @@ const CINEMA_LIGHTS_STATE_KEY = "kisera-cottage-cinema-lights-off";
 const DEFAULT_BACKGROUND_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif"] as const;
 const CINEMA_CONTEXT_NO_SUBTITLE_BUCKET_SECONDS = 24;
 const CINEMA_CONTEXT_REUSE_FRAME_SECONDS = 18;
-const CINEMA_CONTEXT_STRONG_FRAME_CUE = /截图|截屏|画面|镜头|台词|字幕|这一句|这句|这场|这段|这个镜头|他说|她说|它说|说的|写着|刚出现|刚才那句|刚才那个画面|这个画面|这一幕/i;
-const CINEMA_CONTEXT_WEAK_FRAME_CUE = /这里|刚才|这个|这一刻|这一段|那一幕|那段|那个表情|那个动作|这时候|现在这个/i;
-const CINEMA_CONTEXT_CONTINUATION_CUE = /所以|你说|我觉得|继续|接着|然后呢|那是不是|也就是说|这样的话|顺着|往下说|嗯嗯|对对|哈哈/i;
+const CINEMA_CONTEXT_STRONG_FRAME_CUE =
+  /(?:截图|截屏|画面|这张图|这个画面|这个镜头|这帧|这一帧|这一幕|镜头|构图|光线|颜色|色彩|表情|眼神|动作|台词|字幕|这句|这一句|他说|她说|它说|说什么|说的|写着|暂停|定格|刚出现|刚才那句|刚才那个画面)/u;
+const CINEMA_CONTEXT_WEAK_FRAME_CUE =
+  /(?:这里|这儿|刚才|刚刚|这段|这一段|那段|这场|这一场|那一幕|这一刻|这个|那个表情|那个动作|这时候|现在这个|这种感觉)/u;
+const CINEMA_CONTEXT_CONTINUATION_CUE =
+  /(?:所以|你说|我觉得|继续|接着|顺着|刚才你说|然后呢|那是不是|也就是说|这样的话|往下说|确实|对啊|对对|嗯嗯|哈哈|是不是|像不像|让我想到)/u;
 
 function getDefaultCinemaBackgroundSrc(name: "cinema-room-bg" | "cinema-room-bg2", extensionIndex: number) {
   const extension = DEFAULT_BACKGROUND_EXTENSIONS[Math.min(extensionIndex, DEFAULT_BACKGROUND_EXTENSIONS.length - 1)];
-  return `/${name}.${extension}`;
+  return `${import.meta.env.BASE_URL}${name}.${extension}`;
 }
 
 function getAudioTrackList(video: HTMLVideoElement | null): NativeAudioTrackListLike | null {
@@ -200,6 +206,15 @@ function readFileAsText(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error);
     reader.readAsText(file);
   });
+}
+
+function decodeBase64Text(dataBase64: string) {
+  const binary = window.atob(dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
 }
 
 function readFileAsDataUrl(file: File): Promise<string> {
@@ -274,32 +289,30 @@ function makePlanPoints(cues: SubtitleCue[], density: CompanionDensity): Compani
 }
 
 function getCompanionPlanGuidance(density: CompanionDensity, duration: number) {
-  const minutes = Math.max(1, Math.round(duration / 60));
-  if (density === "quiet") {
-    return {
-      range: minutes > 120 ? "8-12" : "6-10",
-      spacing: "宁可少而准，通常间隔 8-15 分钟。",
-      focus: "情绪转折、沉默、关键台词和真正值得轻声提醒的地方。",
-    };
-  }
-  if (density === "talkative") {
-    return {
-      range: minutes > 120 ? "22-32" : "14-24",
-      spacing: "允许更密，但避免连续刷屏；同一段最多保留 1-2 个重点。",
-      focus: "情绪、关系、伏笔、名场面和可自然吐槽的小瞬间。",
-    };
-  }
-  if (density === "breakdown") {
-    return {
-      range: minutes > 120 ? "18-28" : "12-20",
-      spacing: "按镜头/剪辑/表演信息密度取点，不要平均铺满。",
-      focus: "镜头语言、剪辑节奏、表演细节、声音设计和叙事选择。",
-    };
-  }
+  const minutes = Number.isFinite(duration) && duration > 0 ? duration / 60 : 120;
+  const tier = minutes <= 30 ? "short" : minutes <= 90 ? "medium" : minutes <= 150 ? "long" : "epic";
+  const ranges: Record<CompanionDensity, Record<string, string>> = {
+    quiet: { short: "3-5", medium: "5-8", long: "8-12", epic: "10-16" },
+    normal: { short: "5-8", medium: "8-14", long: "12-20", epic: "16-26" },
+    talkative: { short: "8-12", medium: "14-22", long: "20-32", epic: "26-40" },
+    breakdown: { short: "12-20", medium: "24-40", long: "36-60", epic: "50-80" },
+  };
+  const spacing: Record<CompanionDensity, string> = {
+    quiet: "尽量间隔 6-10 分钟以上，除非是连续名场面。",
+    normal: "尽量间隔 3-6 分钟以上，高密度段落可以更近。",
+    talkative: "尽量间隔 90 秒-3 分钟以上，高潮段落允许短时间连续。",
+    breakdown: "可以更密，但仍要避开每句台词都讲；优先镜头、剪辑、调度、声音和叙事转折。",
+  };
+  const focus: Record<CompanionDensity, string> = {
+    quiet: "只挑最值得被陪着看见的情绪转折、关系变化和名场面。",
+    normal: "兼顾陪伴感、剧情理解、情绪反应和少量伏笔观察。",
+    talkative: "可以更主动地吐槽、心疼、提问和观察，但不要变成弹幕机哦。",
+    breakdown: "以拉片视角陪看：镜头语言、剪辑节奏、场面调度、表演细节、声音设计、叙事结构、导演选择。语气仍然是Ta贴在旁边轻声讲，不要像课堂授课。",
+  };
   return {
-    range: minutes > 120 ? "14-22" : "10-16",
-    spacing: "自然分布在关键段落，不要为了数量凑点。",
-    focus: "关键台词、关系变化、情绪节点、伏笔和观影时会想轻声回应的地方。",
+    range: ranges[density][tier],
+    spacing: spacing[density],
+    focus: focus[density],
   };
 }
 
@@ -625,6 +638,7 @@ export function CinemaCompanionRoom({
   const screenshotInputRef = useRef<HTMLInputElement | null>(null);
   const recordThumbnailInputRef = useRef<HTMLInputElement | null>(null);
   const webSourceInputRef = useRef<HTMLInputElement | null>(null);
+  const companionInputRef = useRef<HTMLTextAreaElement | null>(null);
   const thumbnailTargetRef = useRef<WatchRecord | null>(null);
   const lastAutoSaveAtRef = useRef(0);
   const panelCloseTimerRef = useRef<number | undefined>(undefined);
@@ -647,10 +661,12 @@ export function CinemaCompanionRoom({
   } | null>(null);
   const manualScreenshotPendingRef = useRef(false);
   const lastSentWatchContextRef = useRef<LastSentWatchContext | null>(null);
+  const companionChatListRef = useRef<HTMLDivElement | null>(null);
 
   const [videoUrl, setVideoUrl] = useState("");
   const [title, setTitle] = useState("");
   const [sourceLabel, setSourceLabel] = useState("");
+  const [localVideoFilePath, setLocalVideoFilePath] = useState("");
   const [bilibiliQuery, setBilibiliQuery] = useState("");
   const [webSourceUrl, setWebSourceUrl] = useState("");
   const [webFrameSource, setWebFrameSource] = useState<WebFrameSource | null>(null);
@@ -665,6 +681,7 @@ export function CinemaCompanionRoom({
   const [webTimeInput, setWebTimeInput] = useState("00:00");
   const [subtitles, setSubtitles] = useState<SubtitleCue[]>([]);
   const [subtitleFileName, setSubtitleFileName] = useState("");
+  const [subtitleFilePath, setSubtitleFilePath] = useState("");
   const [subtitleOffsetSeconds, setSubtitleOffsetSeconds] = useState(0);
   const [showSubtitlesOnVideo, setShowSubtitlesOnVideo] = useState(true);
   const [subtitlePanelExpanded, setSubtitlePanelExpanded] = useState(true);
@@ -684,6 +701,7 @@ export function CinemaCompanionRoom({
   const [error, setError] = useState("");
   const [isAsking, setIsAsking] = useState(false);
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
+  const [copiedCinemaMessageId, setCopiedCinemaMessageId] = useState("");
   const [audioTrackOptions, setAudioTrackOptions] = useState<CinemaAudioTrackOption[]>([]);
   const [selectedAudioTrackIndex, setSelectedAudioTrackIndex] = useState<number | null>(null);
   const [defaultBackgroundExtensionIndex, setDefaultBackgroundExtensionIndex] = useState(0);
@@ -696,6 +714,46 @@ export function CinemaCompanionRoom({
     }
   });
   const [lightTransitionSequence, setLightTransitionSequence] = useState(0);
+
+  useEffect(() => {
+    if (activePanel !== "companion") return;
+    const frame = window.requestAnimationFrame(() => {
+      const list = companionChatListRef.current;
+      if (!list) return;
+      list.scrollTop = list.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activePanel, messages.length, messages[messages.length - 1]?.text]);
+
+  async function copyCinemaMessage(message: ChatMessage) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(message.text);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = message.text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        document.execCommand("copy");
+        textarea.remove();
+      }
+      setCopiedCinemaMessageId(message.id);
+      window.setTimeout(() => setCopiedCinemaMessageId(""), 1200);
+    } catch {
+      setError("复制失败，浏览器可能限制了剪贴板权限。");
+    }
+  }
+
+  function editCinemaUserMessage(message: ChatMessage) {
+    setUserMessage(message.text);
+    setActivePanel("companion");
+    window.setTimeout(() => companionInputRef.current?.focus(), 0);
+  }
 
   useEffect(() => {
     const refreshImportedRecords = () => setRecords(listWatchRecords());
@@ -992,13 +1050,22 @@ export function CinemaCompanionRoom({
       ?? (webFrameSource?.originalUrl || webFrameSource?.url)
       ?? sourceLabel
       ?? "local file";
+    const localVideoPath = sourceType === "local-file"
+      ? (overrides.videoFilePath ?? localVideoFilePath) || undefined
+      : undefined;
+    const localVideoName = sourceType === "local-file"
+      ? (overrides.videoFileName ?? sourceLabelValue) || undefined
+      : undefined;
     saveWatchRecord({
       title,
       sourceType,
       sourceLabel: sourceLabelValue,
       currentTime: overrides.currentTime ?? time,
       duration: overrides.duration ?? nextDuration,
+      videoFilePath: localVideoPath,
+      videoFileName: localVideoName,
       subtitleFileName: overrides.subtitleFileName ?? (subtitleFileName || undefined),
+      subtitleFilePath: overrides.subtitleFilePath ?? (subtitleFilePath || undefined),
       subtitleCount: overrides.subtitleCount ?? (subtitles.length || undefined),
       subtitleOffsetSeconds: overrides.subtitleOffsetSeconds ?? subtitleOffsetSeconds,
       thumbnailDataUrl: overrides.thumbnailDataUrl ?? thumbnailDataUrl ?? (screenshotDataUrl || undefined),
@@ -1015,7 +1082,8 @@ export function CinemaCompanionRoom({
     setRecords(listWatchRecords());
   }
 
-  function loadRecentWatchConversation(titleValue: string, recordId?: string) {
+  async function loadRecentWatchConversation(titleValue: string, recordId?: string) {
+    await ensureConversationStoreReady();
     const conversation = findWatchConversation(titleValue || "观影对话", recordId || slugifyTitle(titleValue || "cinema"));
     if (!conversation) {
       setMessages([]);
@@ -1032,30 +1100,76 @@ export function CinemaCompanionRoom({
     setMessages(recentMessages);
   }
 
-  async function handleVideoFile(file?: File) {
-    if (!file) return;
-    setError("");
-    if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
-    const nextUrl = URL.createObjectURL(file);
-    const fileTitle = file.name.replace(/\.[^.]+$/, "");
-    const pendingRecord = pendingResumeRef.current;
-    const shouldResume = !!pendingRecord;
-    const nextTitle = shouldResume && pendingRecord ? pendingRecord.title : fileTitle;
-    setVideoUrl(nextUrl);
+  function applySubtitleText(text: string, fileName: string, filePath = "") {
+    const parsed = parseSubtitles(text, fileName);
+    setSubtitles(parsed);
+    setSubtitleFileName(fileName);
+    setSubtitleFilePath(filePath);
+    setShowSubtitlesOnVideo(true);
+    setSubtitlePanelExpanded(true);
+    setSubtitleOffsetSeconds(0);
+    setPlan([]);
+    setTriggeredPlanIds([]);
+    setActiveCompanionPoint(null);
+    setActiveCompanionDelivery(null);
+    setActivePanel("subtitles");
+    saveProgress(currentTime, duration, {
+      subtitleFileName: fileName,
+      subtitleFilePath: filePath || undefined,
+      subtitleCount: parsed.length || undefined,
+      subtitleOffsetSeconds: 0,
+    });
+    if (parsed.length === 0) {
+      setError("没有解析到字幕时间轴。请尝试 SRT、VTT、ASS 或 SSA。");
+    }
+  }
+
+  async function restoreSubtitleFromRecord(record?: WatchRecord | null) {
+    if (!record?.subtitleFilePath || !window.kicoDesktop?.readTextFile) return false;
+    try {
+      const result = await window.kicoDesktop.readTextFile(record.subtitleFilePath);
+      const text = result.dataBase64 ? decodeBase64Text(result.dataBase64) : "";
+      if (!result.success || !text) throw new Error(result.error || "字幕读取失败。");
+      const fileName = record.subtitleFileName || record.subtitleFilePath.split(/[\\/]/).pop() || "subtitle.srt";
+      const parsed = parseSubtitles(text, fileName);
+      setSubtitles(parsed);
+      setSubtitleFileName(fileName);
+      setSubtitleFilePath(record.subtitleFilePath);
+      setShowSubtitlesOnVideo(true);
+      setSubtitlePanelExpanded(true);
+      return parsed.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function loadLocalVideoSource(
+    source: { url: string; title: string; fileName?: string; filePath?: string },
+    resumeRecord: WatchRecord | null = pendingResumeRef.current,
+  ) {
+    const existingRecord = resumeRecord ?? listWatchRecords().find((record) => slugifyTitle(record.title) === slugifyTitle(source.title)) ?? null;
+    const nextTitle = existingRecord?.title || source.title;
+    const nextTime = existingRecord?.currentTime || 0;
+    if (videoUrl.startsWith("blob:") && videoUrl !== source.url) URL.revokeObjectURL(videoUrl);
+    setVideoUrl(source.url);
     setTitle(nextTitle);
-    setSourceLabel(file.name);
-    pendingInitialTimeRef.current = shouldResume && pendingRecord ? pendingRecord.currentTime : null;
+    setSourceLabel(source.fileName || existingRecord?.videoFileName || existingRecord?.sourceLabel || source.title);
+    setLocalVideoFilePath(source.filePath || existingRecord?.videoFilePath || "");
+    pendingInitialTimeRef.current = nextTime > 0 ? nextTime : null;
     pendingResumeRef.current = null;
-    setCurrentTime(shouldResume && pendingRecord ? pendingRecord.currentTime : 0);
-    setWebTimeInput(formatTime(shouldResume && pendingRecord ? pendingRecord.currentTime : 0));
-    setSubtitleOffsetSeconds(pendingRecord?.subtitleOffsetSeconds ?? 0);
+    setCurrentTime(nextTime);
+    setWebTimeInput(formatTime(nextTime));
+    setSubtitles([]);
+    setSubtitleFileName(existingRecord?.subtitleFileName || "");
+    setSubtitleFilePath(existingRecord?.subtitleFilePath || "");
+    setSubtitleOffsetSeconds(existingRecord?.subtitleOffsetSeconds ?? 0);
     setScreenshotDataUrl("");
     manualScreenshotPendingRef.current = false;
     lastSentWatchContextRef.current = null;
-    setPlan(shouldResume && pendingRecord?.companionPlan ? pendingRecord.companionPlan : []);
-    setCompanionMode(normalizeCompanionMode(pendingRecord?.companionMode));
-    setCompanionDensity(normalizeCompanionDensity(pendingRecord?.companionDensity));
-    setTriggeredPlanIds(shouldResume && pendingRecord?.triggeredPlanIds ? pendingRecord.triggeredPlanIds : []);
+    setPlan(existingRecord?.companionPlan ?? []);
+    setCompanionMode(normalizeCompanionMode(existingRecord?.companionMode));
+    setCompanionDensity(normalizeCompanionDensity(existingRecord?.companionDensity));
+    setTriggeredPlanIds(existingRecord?.triggeredPlanIds ?? []);
     setActiveCompanionPoint(null);
     setActiveCompanionDelivery(null);
     setWebFrameSource(null);
@@ -1063,8 +1177,54 @@ export function CinemaCompanionRoom({
     setAudioTrackOptions([]);
     selectedAudioTrackIndexRef.current = null;
     setSelectedAudioTrackIndex(null);
-    loadRecentWatchConversation(nextTitle, pendingRecord?.id || slugifyTitle(nextTitle));
+    setActivePanel("none");
+    loadRecentWatchConversation(nextTitle, existingRecord?.id || slugifyTitle(nextTitle));
+    if (existingRecord?.subtitleFilePath) void restoreSubtitleFromRecord(existingRecord);
+    const extension = (source.fileName || source.title).split(".").pop()?.toLowerCase() || "";
+    setError(
+      extension === "mkv"
+        ? "MKV 可以载入，但是否能播放取决于影片编码和当前 Electron/Chromium 支持。"
+        : "",
+    );
     enterMovieAtmosphere();
+  }
+
+  async function openVideoPicker(record?: WatchRecord | null) {
+    if (record) pendingResumeRef.current = record;
+    if (window.kicoDesktop?.pickVideoFile) {
+      const result = await window.kicoDesktop.pickVideoFile();
+      if (result.canceled) {
+        if (record) pendingResumeRef.current = null;
+        return;
+      }
+      if (!result.success || !result.url || !result.name) {
+        if (record) pendingResumeRef.current = null;
+        setError(result.error || "影片读取失败，请重新选择。");
+        return;
+      }
+      loadLocalVideoSource({
+        url: result.url,
+        title: record?.title || result.name.replace(/\.[^.]+$/, ""),
+        fileName: result.name,
+        filePath: result.path,
+      }, record ?? pendingResumeRef.current);
+      return;
+    }
+    videoInputRef.current?.click();
+  }
+
+  async function handleVideoFile(file?: File) {
+    if (!file) return;
+    setError("");
+    const nextUrl = URL.createObjectURL(file);
+    const fileTitle = file.name.replace(/\.[^.]+$/, "");
+    loadLocalVideoSource({
+      url: nextUrl,
+      title: fileTitle,
+      fileName: file.name,
+      filePath: (file as File & { path?: string }).path,
+    }, pendingResumeRef.current);
+    if (videoInputRef.current) videoInputRef.current.value = "";
   }
 
   function closeVideo() {
@@ -1072,9 +1232,14 @@ export function CinemaCompanionRoom({
     setVideoUrl("");
     setTitle("");
     setSourceLabel("");
+    setLocalVideoFilePath("");
     setDuration(0);
     setCurrentTime(0);
     setWebTimeInput("00:00");
+    setSubtitles([]);
+    setSubtitleFileName("");
+    setSubtitleFilePath("");
+    setSubtitleOffsetSeconds(0);
     setScreenshotDataUrl("");
     manualScreenshotPendingRef.current = false;
     lastSentWatchContextRef.current = null;
@@ -1218,31 +1383,32 @@ export function CinemaCompanionRoom({
     }
   }
 
+  async function openSubtitlePicker() {
+    if (window.kicoDesktop?.pickSubtitleFile) {
+      setError("");
+      const result = await window.kicoDesktop.pickSubtitleFile();
+      if (result.canceled) return;
+      const text = result.dataBase64 ? decodeBase64Text(result.dataBase64) : "";
+      if (!result.success || !text || !result.name) {
+        setError(result.error || "字幕文件读取失败，请换一个字幕文件试试。");
+        return;
+      }
+      applySubtitleText(text, result.name, result.path || "");
+      return;
+    }
+    subtitleInputRef.current?.click();
+  }
+
   async function handleSubtitleFile(file?: File) {
     if (!file) return;
     setError("");
     try {
       const text = await readFileAsText(file);
-      const parsed = parseSubtitles(text, file.name);
-      setSubtitles(parsed);
-      setSubtitleFileName(file.name);
-      setShowSubtitlesOnVideo(true);
-      setSubtitlePanelExpanded(true);
-      setSubtitleOffsetSeconds(0);
-      setPlan([]);
-      setTriggeredPlanIds([]);
-      setActiveCompanionPoint(null);
-      setActiveCompanionDelivery(null);
-      setActivePanel("subtitles");
-      saveProgress(currentTime, duration, {
-        subtitleFileName: file.name,
-        subtitleCount: parsed.length || undefined,
-      });
-      if (parsed.length === 0) {
-        setError("没有解析到字幕时间轴。请尝试 SRT、VTT、ASS 或 SSA。");
-      }
+      applySubtitleText(text, file.name, (file as File & { path?: string }).path || "");
     } catch (event) {
       setError(event instanceof Error ? event.message : "字幕读取失败。");
+    } finally {
+      if (subtitleInputRef.current) subtitleInputRef.current.value = "";
     }
   }
 
@@ -1265,6 +1431,7 @@ export function CinemaCompanionRoom({
     const source = createBilibiliFrameSource(query);
     if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
     setVideoUrl("");
+    setLocalVideoFilePath("");
     setWebFrameSource(source);
     setWebFrameVisible(true);
     setTitle(source.title);
@@ -1285,6 +1452,7 @@ export function CinemaCompanionRoom({
       currentTime: 0,
       duration: 0,
       subtitleFileName: subtitleFileName || undefined,
+      subtitleFilePath: subtitleFilePath || undefined,
       subtitleCount: subtitles.length || undefined,
       subtitleOffsetSeconds,
       webUrl: source.url,
@@ -1306,6 +1474,7 @@ export function CinemaCompanionRoom({
     const source = createBilibiliFrameSource(url);
     if (videoUrl.startsWith("blob:")) URL.revokeObjectURL(videoUrl);
     setVideoUrl("");
+    setLocalVideoFilePath("");
     setWebFrameSource(source);
     setWebFrameVisible(true);
     setTitle(source.title);
@@ -1325,6 +1494,7 @@ export function CinemaCompanionRoom({
       currentTime: 0,
       duration: 0,
       subtitleFileName: subtitleFileName || undefined,
+      subtitleFilePath: subtitleFilePath || undefined,
       subtitleCount: subtitles.length || undefined,
       subtitleOffsetSeconds,
       webUrl: source.url,
@@ -1362,7 +1532,7 @@ export function CinemaCompanionRoom({
     });
   }
 
-  function handleLoadRecord(record: WatchRecord) {
+  async function handleLoadRecord(record: WatchRecord) {
     setError("");
     loadRecentWatchConversation(record.title, record.id);
     setPlan(record.companionPlan ?? []);
@@ -1385,6 +1555,7 @@ export function CinemaCompanionRoom({
         mode: record.webMode || fallbackSource.mode,
       };
       setVideoUrl("");
+      setLocalVideoFilePath("");
       setWebFrameSource(nextSource);
       setWebFrameVisible(true);
       setTitle(record.title);
@@ -1395,6 +1566,8 @@ export function CinemaCompanionRoom({
       setScreenshotDataUrl(record.thumbnailDataUrl || "");
       manualScreenshotPendingRef.current = false;
       lastSentWatchContextRef.current = null;
+      setSubtitleFileName(record.subtitleFileName || "");
+      setSubtitleFilePath(record.subtitleFilePath || "");
       setSubtitleOffsetSeconds(record.subtitleOffsetSeconds ?? 0);
       setIsFloating(false);
       setActivePanel("none");
@@ -1406,10 +1579,31 @@ export function CinemaCompanionRoom({
     if (videoRef.current && currentTitleId === recordTitleId) {
       videoRef.current.currentTime = record.currentTime;
       setCurrentTime(record.currentTime);
+      setSubtitleFileName(record.subtitleFileName || subtitleFileName);
+      setSubtitleFilePath(record.subtitleFilePath || subtitleFilePath);
       setSubtitleOffsetSeconds(record.subtitleOffsetSeconds ?? 0);
+      if (record.subtitleFilePath) void restoreSubtitleFromRecord(record);
       lastSentWatchContextRef.current = null;
       setActivePanel("none");
       return;
+    }
+
+    if (record.videoFilePath && window.kicoDesktop?.registerLocalFile) {
+      try {
+        const result = await window.kicoDesktop.registerLocalFile(record.videoFilePath);
+        if (!result.success || !result.url || !result.name) {
+          throw new Error(result.error || "本地影片路径已失效。");
+        }
+        loadLocalVideoSource({
+          url: result.url,
+          title: record.title,
+          fileName: result.name,
+          filePath: result.path || record.videoFilePath,
+        }, record);
+        return;
+      } catch (event) {
+        setError(event instanceof Error ? event.message : "本地影片路径已失效，请重新选择影片。");
+      }
     }
 
     pendingResumeRef.current = record;
@@ -1417,7 +1611,7 @@ export function CinemaCompanionRoom({
     setSourceLabel(record.sourceLabel);
     setSubtitleOffsetSeconds(record.subtitleOffsetSeconds ?? 0);
     setError(`请选择同名影片：${record.title}。加载后会自动跳到 ${formatTime(record.currentTime)}。`);
-    videoInputRef.current?.click();
+    void openVideoPicker(record);
   }
 
   function handleRemoveRecord(record: WatchRecord) {
@@ -1436,7 +1630,7 @@ export function CinemaCompanionRoom({
     setEditingRecordTitle("");
   }
 
-  function commitRenameRecord(record: WatchRecord) {
+  async function commitRenameRecord(record: WatchRecord) {
     const nextTitle = editingRecordTitle.trim();
     if (!nextTitle || nextTitle === record.title) {
       cancelRenameRecord();
@@ -1450,6 +1644,7 @@ export function CinemaCompanionRoom({
       return;
     }
 
+    await ensureConversationStoreReady();
     renameWatchConversationLink(record.id, record.title, renamed.id, renamed.title);
     if (wasCurrent) {
       setTitle(renamed.title);
@@ -1473,7 +1668,7 @@ export function CinemaCompanionRoom({
     setTriggeredPlanIds(record.triggeredPlanIds ?? []);
     setActiveCompanionPoint(null);
     setActiveCompanionDelivery(null);
-    videoInputRef.current?.click();
+    void openVideoPicker(record);
   }
 
   function formatSubtitleBlock(label: string, cues: SubtitleCue[]) {
@@ -1744,6 +1939,7 @@ export function CinemaCompanionRoom({
         }
         return [...items, { id: companionMessageId, role: "companion", text: response.text }];
       });
+      await ensureConversationStoreReady();
       const conversation = getOrCreateWatchConversation(title || "观影对话", slugifyTitle(title || "cinema"));
       const frameAttachment = contextAction === "refreshFrame" && uplinkSettings.contextLoad.attachScreenshot
         ? makeFrameAttachment(frame, title || "观影截图", currentTime)
@@ -1994,7 +2190,7 @@ export function CinemaCompanionRoom({
         ref={videoInputRef}
         className="visually-hidden-file"
         type="file"
-        accept="video/*,.mp4,.webm,.mov,.m4v,.ogg,.mkv"
+        accept="video/*,.mp4,.webm,.mov,.m4v,.ogg,.mkv,.avi,.rmvb"
         onChange={(event) => handleVideoFile(event.target.files?.[0])}
       />
       <input
@@ -2136,17 +2332,16 @@ export function CinemaCompanionRoom({
               ) : (
                 <div className="empty-player">
                   <div className="empty-player-actions">
-                    <label className="glass-action">
+                    <button type="button" className="glass-action" onClick={() => void openVideoPicker()}>
                       <Upload size={17} />
                       <span>上传影片</span>
-                      <input type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.ogg,.mkv" onChange={(event) => handleVideoFile(event.target.files?.[0])} />
-                    </label>
+                    </button>
                     <button type="button" className="glass-action" onClick={() => setActivePanel("source")}>
                       <Search size={17} />
                       <span>查找片源/字幕文件</span>
                     </button>
                   </div>
-                  <span className="format-hint">MP4 最稳；MKV 取决于浏览器和设备支持。</span>
+                  <span className="format-hint">MP4 最稳；桌面版可直接续看本地路径，MKV 取决于影片编码支持。</span>
                 </div>
               )}
               {subtitleWindow.active && showSubtitlesOnVideo && (
@@ -2323,7 +2518,7 @@ export function CinemaCompanionRoom({
                       <Subtitles size={14} />
                       <span>{showSubtitlesOnVideo ? "字幕开" : "字幕关"}</span>
                     </button>
-                    <button type="button" className="subtitle-pill" onClick={() => subtitleInputRef.current?.click()}>
+                    <button type="button" className="subtitle-pill" onClick={() => void openSubtitlePicker()}>
                       <Upload size={14} />
                       <span>{subtitles.length > 0 ? "更换字幕" : "上传字幕"}</span>
                     </button>
@@ -2540,7 +2735,7 @@ export function CinemaCompanionRoom({
                   <X size={16} />
                 </button>
               </div>
-              <div className="chat-list">
+              <div className="chat-list" ref={companionChatListRef}>
                 {messages.map((message) => (
                   <div
                     key={message.id}
@@ -2551,13 +2746,30 @@ export function CinemaCompanionRoom({
                     }`}
                   >
                     <MarkdownText text={message.text} className="cinema-companion-markdown" />
+                    {message.role === "user" ? (
+                      <div className="cinema-message-actions" aria-label="用户消息操作">
+                        <button type="button" onClick={() => void copyCinemaMessage(message)} title={copiedCinemaMessageId === message.id ? "已复制" : "复制"}>
+                          {copiedCinemaMessageId === message.id ? <Check size={12} /> : <Copy size={12} />}
+                        </button>
+                        <button type="button" onClick={() => editCinemaUserMessage(message)} title="编辑后重新发送">
+                          <Edit2 size={12} />
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>
               <div className="companion-input-row">
                 <textarea
+                  ref={companionInputRef}
                   value={userMessage}
                   onChange={(event) => setUserMessage(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                      event.preventDefault();
+                      if (!isAsking && userMessage.trim()) void handleAskCompanion();
+                    }
+                  }}
                   rows={1}
                   placeholder="这一刻想聊点什么..."
                 />
@@ -2587,7 +2799,7 @@ export function CinemaCompanionRoom({
                 <Clapperboard size={24} />
                 <strong>片单还空着</strong>
                 <p className="muted">上传影片、暂停、拖动进度，或者绑定网页片源后，会自动记录续看位置。</p>
-                <button type="button" className="soft-button" onClick={() => videoInputRef.current?.click()}>
+                <button type="button" className="soft-button" onClick={() => void openVideoPicker()}>
                   <Upload size={15} />
                   上传第一部影片
                 </button>
@@ -2619,13 +2831,13 @@ export function CinemaCompanionRoom({
                         role="button"
                         tabIndex={0}
                         onClick={() => {
-                          if (editingRecordId !== record.id) handleLoadRecord(record);
+                          if (editingRecordId !== record.id) void handleLoadRecord(record);
                         }}
                         onKeyDown={(event) => {
                           if (editingRecordId === record.id) return;
                           if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
-                            handleLoadRecord(record);
+                            void handleLoadRecord(record);
                           }
                         }}
                       >
@@ -2675,14 +2887,16 @@ export function CinemaCompanionRoom({
                         <button type="button" onClick={() => handleChangeRecordSource(record)} title="更换片源，保留这条记录的字幕信息、续看位置和陪看计划。">
                           换源
                         </button>
-                        <button type="button" className="record-resume" onClick={() => handleLoadRecord(record)}>
+                        <button type="button" className="record-resume" onClick={() => void handleLoadRecord(record)}>
                           {isCurrent ? "跳转续看" : "续看"}
                         </button>
                         <button
                           type="button"
                           onClick={() => {
+                            void ensureConversationStoreReady().then(() => {
                             const conversation = getOrCreateWatchConversation(record.title, record.id);
                             onOpenConversation?.(conversation.id);
+                            });
                           }}
                         >
                           会话
@@ -2698,7 +2912,7 @@ export function CinemaCompanionRoom({
             )}
             {records.length > 0 && (
               <div className="playlist-footnote">
-                本地影片续看时需要重新选择片源；网页/B站片源会直接回到网页窗口，并保留手动校对时间、字幕信息和陪看星图。
+                桌面版会优先直接续看本地影片；网页/手机端需要重新选择片源。续看位置、字幕信息和陪看星图会保留。
               </div>
             )}
           </div>

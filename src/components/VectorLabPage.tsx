@@ -34,6 +34,7 @@ import {
   getVectorIndexGuideStatus,
   getVectorOnDemandStatus,
   importVectorIndexBackup,
+  markInterruptedVectorBuildStatus,
   rebuildVectorIndex,
   retrieveMemorySnippetsDetailed,
   subscribeContextRetrievalHistory,
@@ -64,6 +65,7 @@ const DEFAULT_BRIDGE_URL = "http://127.0.0.1:3210";
 const BRIDGE_URL_KEY = "kisera_cottage_obsidian_bridge_url_v1";
 const OBSIDIAN_ROOT_KEY = "kisera_cottage_obsidian_root_path_v1";
 const OBSIDIAN_SELECTED_FOLDERS_KEY = "kisera_cottage_obsidian_selected_folders_v1";
+let vectorBuildAbortController: AbortController | null = null;
 const SOURCE_LABELS: Record<string, string> = {
   "memory-bank": "记忆库",
   obsidian_note: "Obsidian",
@@ -367,6 +369,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
   const [bridgeError, setBridgeError] = useState("");
   const [isSyncing, setIsSyncing] = useState(false);
   const [isReadingFolders, setIsReadingFolders] = useState(false);
+  const [isRebuildingIndex, setIsRebuildingIndex] = useState(() => !!vectorBuildAbortController);
   const [obsidianFolders, setObsidianFolders] = useState<ObsidianFolderRow[]>([]);
   const [obsidianSelectedFolders, setObsidianSelectedFolders] = useState<string[]>(() => readStoredStringArray(OBSIDIAN_SELECTED_FOLDERS_KEY));
   const [obsidianExpandedFolders, setObsidianExpandedFolders] = useState<Record<string, boolean>>({});
@@ -413,6 +416,15 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
     };
     refresh();
     return subscribeVectorStore(refresh);
+  }, []);
+
+  useEffect(() => {
+    const current = getVectorBuildStatus();
+    if (current.state === "running" && !vectorBuildAbortController) {
+      const interrupted = markInterruptedVectorBuildStatus("上次索引构建被页面刷新或关闭中断，旧索引已保留。");
+      setBuildStatus(interrupted);
+      setIndexNotice("上次索引构建被中断，旧索引已保留；需要时可以重新点击重建。");
+    }
   }, []);
 
   const onDemandStatus = useMemo(() => getVectorOnDemandStatus(settings), [settings]);
@@ -574,6 +586,17 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
   }
 
   async function handleRebuildIndex() {
+    if (buildStatus.state === "running") {
+      if (vectorBuildAbortController) {
+        vectorBuildAbortController.abort();
+        setIndexNotice("正在停止索引构建，当前请求结束后会恢复按钮。旧索引会保留。");
+        return;
+      }
+      const interrupted = markInterruptedVectorBuildStatus("索引构建状态已恢复，旧索引已保留。");
+      setBuildStatus(interrupted);
+      setIndexNotice("索引构建状态已恢复，旧索引已保留；需要时可以重新点击重建。");
+      return;
+    }
     const persona = getActivePersona(loadPersonaProfile());
     const notices: string[] = [];
     if (!persona.systemPrompt.trim()) notices.push("人格核目前为空；它常驻上下文，不参与 embedding，可稍后在人格核页面补写。");
@@ -585,9 +608,21 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
     if (embeddingRuntime.usesLocalFallback) notices.push("未配置远程 embedding，本次将建立本地 RAG 索引。");
     setIndexNotice(notices.join(" ") || `正在使用 ${embeddingRuntime.model} 建立索引。`);
     setOpenPanels((current) => ({ ...current, indexStatus: true }));
-    const nextStatus = await rebuildVectorIndex(settings);
+    const controller = new AbortController();
+    vectorBuildAbortController = controller;
+    setIsRebuildingIndex(true);
+    const nextStatus = await rebuildVectorIndex(settings, { signal: controller.signal }).finally(() => {
+      if (vectorBuildAbortController === controller) {
+        vectorBuildAbortController = null;
+      }
+      setIsRebuildingIndex(false);
+    });
     setBuildStatus(nextStatus);
     setObsidianMeta(getObsidianDocMeta());
+    if (nextStatus.state === "paused") {
+      setIndexNotice(nextStatus.error || "索引构建已停止，旧索引已保留。");
+      return;
+    }
     setIndexNotice(nextStatus.state === "error"
       ? `索引构建失败：${nextStatus.error || "请检查 embedding 配置。"}`
       : `${nextStatus.provider === "local" ? "本地 RAG" : "Embedding"} 索引已完成：新建 ${nextStatus.embedded}，复用 ${nextStatus.reused}。`);
@@ -992,12 +1027,13 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
             {openPanels.indexStatus ? (
               <div className="vector-panel-body">
                 <div className="vector-test-actions vector-index-actions">
-                  <button type="button" className={`vector-action-primary vector-rebuild-button ${indexGuide.needsRebuild && buildStatus.state !== "running" ? "needs-attention" : ""}`} onClick={handleRebuildIndex} disabled={buildStatus.state === "running"}>
+                  <button type="button" className={`vector-action-primary vector-rebuild-button ${indexGuide.needsRebuild && buildStatus.state !== "running" ? "needs-attention" : ""}`} onClick={handleRebuildIndex}>
                     <span className="vector-rebuild-particles" aria-hidden="true"><i /><i /><CottageStar /></span>
-                    <RefreshCcw size={16} className={buildStatus.state === "running" ? "vector-spin" : ""} />
+                    <RefreshCcw size={16} className={isRebuildingIndex ? "vector-spin" : ""} />
+                    {buildStatus.state === "running" ? "⏹ " : null}
                     {buildStatus.state === "running" ? `${buildStatus.progress}%` : "重建"}
                   </button>
-                  <button type="button" className="secondary" onClick={() => downloadVectorIndexBackup()}><Download size={16} />导出</button>
+                  <button type="button" className="secondary" onClick={() => { void downloadVectorIndexBackup(); }}><Download size={16} />导出</button>
                   <label className="vector-clear-button">
                     <Upload size={16} />
                     导入

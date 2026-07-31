@@ -123,7 +123,7 @@ describe("session state card sealed-window behavior", () => {
     expect(getSessionStateCard("session-test")?.lastMessageCount).toBe(2);
   });
 
-  it("updates before a coverage gap opens between the card and recent-message window", async () => {
+  it("does not rewrite just because a small coverage gap appears", async () => {
     const llm: LLMAdapter = {
       complete: vi.fn(async (): Promise<CompanionResponse> => ({ text: validCard() })),
     };
@@ -136,6 +136,44 @@ describe("session state card sealed-window behavior", () => {
       makeConversation(makeMessages(12)),
       6,
       "继续聊当前内容",
+    );
+
+    expect(result).toBeNull();
+    expect(llm.complete).not.toHaveBeenCalled();
+  });
+
+  it("updates after enough newly sealed messages accumulate", async () => {
+    const llm: LLMAdapter = {
+      complete: vi.fn(async (): Promise<CompanionResponse> => ({ text: validCard() })),
+    };
+    await updateSessionStateCard(llm, profile, makeConversation(makeMessages(8)), 6);
+    vi.mocked(llm.complete).mockClear();
+
+    const result = await updateSessionStateCard(
+      llm,
+      profile,
+      makeConversation(makeMessages(16)),
+      6,
+      "继续聊当前内容",
+    );
+
+    expect(result?.lastMessageCount).toBe(10);
+    expect(llm.complete).toHaveBeenCalledOnce();
+  });
+
+  it("allows a topic shift to update before the full batch threshold", async () => {
+    const llm: LLMAdapter = {
+      complete: vi.fn(async (): Promise<CompanionResponse> => ({ text: validCard() })),
+    };
+    await updateSessionStateCard(llm, profile, makeConversation(makeMessages(8)), 6);
+    vi.mocked(llm.complete).mockClear();
+
+    const result = await updateSessionStateCard(
+      llm,
+      profile,
+      makeConversation(makeMessages(12)),
+      6,
+      "对了，我们换个话题",
     );
 
     expect(result?.lastMessageCount).toBe(6);

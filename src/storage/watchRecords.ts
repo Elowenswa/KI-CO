@@ -67,11 +67,15 @@ export function saveWatchRecord(record: Omit<WatchRecord, "id" | "updatedAt">): 
   const records = readRecords();
   const id = slugifyTitle(record.title);
   const previous = records.find((item) => item.id === id);
+  const isLocalSource = record.sourceType === "local-file";
   const next: WatchRecord = {
     ...previous,
     ...record,
     thumbnailDataUrl: record.thumbnailDataUrl || previous?.thumbnailDataUrl,
+    videoFilePath: isLocalSource ? record.videoFilePath || previous?.videoFilePath : undefined,
+    videoFileName: isLocalSource ? record.videoFileName || previous?.videoFileName : undefined,
     subtitleFileName: record.subtitleFileName || previous?.subtitleFileName,
+    subtitleFilePath: record.subtitleFilePath || previous?.subtitleFilePath,
     subtitleCount: record.subtitleCount || previous?.subtitleCount,
     subtitleOffsetSeconds: record.subtitleOffsetSeconds ?? previous?.subtitleOffsetSeconds,
     companionPlan: record.companionPlan ?? previous?.companionPlan,

@@ -356,22 +356,22 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
 
   async function handleFullBackup() {
     downloadBackup(
-      `KISERA_COTTAGE_FULL_BACKUP_${backupDateLabel()}.json`,
+      `KI-CO_FULL_${backupDateLabel()}.json`,
       await createFullBackup(settings, personaProfile),
     );
   }
 
   function handleSettingsBackup() {
     downloadBackup(
-      `kisera_cottage_settings_${backupDateLabel()}.json`,
+      `KI-CO_SETTINGS_${backupDateLabel()}.json`,
       createSettingsBackup(settings, personaProfile),
     );
   }
 
-  function handleTravelPack() {
+  async function handleTravelPack() {
     downloadBackup(
-      `KISERA_COTTAGE_TRAVEL_PACK_${backupDateLabel()}.json`,
-      createTravelPack(settings, personaProfile),
+      `KI-CO_TRAVEL_${backupDateLabel()}.json`,
+      await createTravelPack(settings, personaProfile),
     );
   }
 
@@ -844,12 +844,12 @@ export function UplinkSettingsPanel({ settings, onChange, personaProfile, onPers
           </div>
           <div className="memory-context-settings">
             <label className="memory-context-range">
-              <span><strong>短期记忆携带量</strong><small>当前保留在原文窗口里的最近消息；状态卡只整理它之前的内容。</small></span>
+              <span><strong>短期记忆携带量</strong><small>默认 10 条；当前保留在原文窗口里的最近消息，状态卡只整理它之前的内容。</small></span>
               <b>{settings.contextLoad.shortTermMessageLimit} 条</b>
               <input type="range" min={6} max={100} step={2} value={settings.contextLoad.shortTermMessageLimit} onChange={(event) => updateContextLoad({ shortTermMessageLimit: Number(event.target.value) })} />
             </label>
             <label className="memory-context-range">
-              <span><strong>记忆总结周期</strong><small>每累计多少轮新对话，自动整理一篇日记。</small></span>
+              <span><strong>记忆总结周期</strong><small>默认 20 轮；适合和 10 条短期上下文配合。</small></span>
               <b>{chroniclePreferences.summaryFrequency} 轮</b>
               <input type="range" min={5} max={100} step={5} value={chroniclePreferences.summaryFrequency} onChange={(event) => setChroniclePreferences(saveChroniclePreferences({ summaryFrequency: Number(event.target.value) }))} />
             </label>

@@ -8449,6 +8449,7 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
 }
 
 .cinema-shell[data-theme] .sofa-companion .chat-bubble {
+  position: relative;
   max-width: 88%;
   border-radius: 16px;
   padding: 8px 12px;
@@ -8463,6 +8464,44 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
   border-bottom-right-radius: 6px;
   color: rgba(255, 255, 255, 0.90);
   background: rgba(255, 255, 255, 0.15);
+}
+
+.cinema-shell[data-theme] .sofa-companion .chat-bubble.user {
+  padding-right: 34px;
+}
+
+.cinema-message-actions {
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  display: inline-flex;
+  gap: 2px;
+  opacity: 0.18;
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.chat-bubble.user:hover .cinema-message-actions,
+.chat-bubble.user:focus-within .cinema-message-actions {
+  opacity: 0.62;
+}
+
+.cinema-message-actions button {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.74);
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0;
+  cursor: pointer;
+}
+
+.cinema-message-actions button:hover {
+  color: rgba(255, 255, 255, 0.94);
+  background: rgba(255, 255, 255, 0.16);
 }
 
 .cinema-shell[data-theme] .sofa-companion .chat-bubble.companion {
@@ -12600,7 +12639,7 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
 
 .chronicle-search-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
   margin-bottom: 20px;
 }
@@ -12743,7 +12782,29 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
 .chronicle-empty > svg { width: 42px; height: 42px; }
 .chronicle-empty p { margin: 0; font-size: 0.76rem; }
 .chronicle-empty.compact { min-height: 110px; }
-.chronicle-notice { position: fixed; z-index: 90; right: 22px; bottom: 22px; display: inline-flex; max-width: min(420px, calc(100vw - 44px)); align-items: center; gap: 9px; border: 1px solid var(--kx-primary); border-radius: 7px; color: var(--kx-text-main); background: var(--kx-panel-bg); padding: 10px 12px; box-shadow: 0 12px 34px var(--kx-shadow); font-size: 0.72rem; }
+.chronicle-notice {
+  position: fixed;
+  z-index: 90;
+  right: 22px;
+  bottom: 22px;
+  display: inline-flex;
+  max-width: min(420px, calc(100vw - 44px));
+  align-items: center;
+  gap: 9px;
+  border: 1px solid color-mix(in srgb, var(--kx-primary) 42%, var(--kx-border));
+  border-radius: 7px;
+  color: var(--kx-text-main);
+  background: color-mix(in srgb, var(--kx-panel-bg) 82%, var(--kx-primary) 8%);
+  padding: 10px 12px;
+  box-shadow: 0 12px 34px var(--kx-shadow);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+.chronicle-notice svg {
+  flex: 0 0 auto;
+  color: currentColor;
+  opacity: 0.72;
+}
 .chronicle-spin { animation: vector-spin 1s linear infinite; }
 
 .chronicle-modal-backdrop { position: fixed; z-index: 120; inset: 0; display: grid; place-items: center; overflow-y: auto; background: rgba(10, 8, 12, 0.68); padding: 18px; backdrop-filter: blur(8px); }
@@ -13419,6 +13480,7 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  width: 100%;
   border: 1px solid color-mix(in srgb, var(--kx-secondary) 18%, transparent);
   border-radius: 12px;
   color: color-mix(in srgb, var(--kx-text-main) 50%, transparent);
@@ -13426,6 +13488,7 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
   padding: 7px 10px;
   font-size: 0.6rem;
   letter-spacing: 0.08em;
+  cursor: pointer;
 }
 
 .continuity-seed-foot strong {
@@ -13435,10 +13498,25 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
   font-weight: 500;
   line-height: 1;
 }
+
+.continuity-seed-foot:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.continuity-seed-foot:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--kx-primary) 30%, var(--kx-border));
+  background: color-mix(in srgb, var(--kx-primary) 8%, var(--kx-panel-bg));
+}
 .seed-dialog > p { margin: 0; color: var(--kx-muted); font-size: 0.7rem; }
 .seed-dialog > div { display: grid; gap: 8px; }
 .seed-dialog article { border: 1px solid var(--kx-border); border-radius: 7px; background: var(--kx-panel-soft); padding: 12px; }
 .seed-dialog article > span { color: var(--kx-primary); font-family: "Cormorant Garamond", Georgia, serif; font-size: 0.7rem; }
+.seed-dialog h2 {
+  font-family: var(--kico-morandi-title-font, "Noto Serif SC", "Source Han Serif SC", "Songti SC", "STSong", "SimSun", serif);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
 .seed-dialog h3 { margin: 5px 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 .seed-dialog article p { color: var(--kx-muted); font-size: 0.76rem; line-height: 1.7; }
 .seed-dialog article i { margin-right: 7px; color: var(--kx-secondary); font-size: 0.62rem; font-style: normal; opacity: .62; }
@@ -13459,7 +13537,7 @@ body:has(.cottage-chat-shell[data-theme="custom"]) {
   .chronicle-month-copy h2 { font-size: .88rem; }
   .chronicle-month-copy p { font-size: .65rem; }
   .chronicle-month-meta { padding-right: 13px; }
-  .chronicle-search-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .chronicle-search-row { grid-template-columns: minmax(0, 1fr) auto auto; gap: 5px; }
   .chronicle-search-row > button { padding-inline: 8px; }
   .chronicle-entry { grid-template-columns: 22px minmax(0, 1fr); }
   .chronicle-entry-card { padding: 13px 12px; }
@@ -15573,6 +15651,60 @@ textarea::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, #4f4365 10%, var(--kx-panel-soft)) !important;
 }
 
+.chronicle-route-shell[data-theme="custom"] .chronicle-notice {
+  border-color: rgba(166, 148, 188, 0.38) !important;
+  color: #4f4365 !important;
+  background:
+    radial-gradient(circle at 12% 0%, rgba(166, 148, 188, 0.18), transparent 34%),
+    linear-gradient(135deg, rgba(239, 233, 242, 0.98), rgba(251, 249, 252, 0.98) 56%, rgba(232, 221, 236, 0.92)) !important;
+  box-shadow: 0 14px 38px rgba(79, 67, 101, 0.18) !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .chronicle-notice svg {
+  color: #4f4365 !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog {
+  border-color: rgba(166, 148, 188, 0.30) !important;
+  background:
+    radial-gradient(circle at 10% 0%, rgba(166, 148, 188, 0.20), transparent 34%),
+    radial-gradient(circle at 88% 96%, rgba(162, 133, 118, 0.08), transparent 36%),
+    linear-gradient(145deg, rgba(239, 233, 242, 0.98), rgba(251, 249, 252, 0.98) 62%, rgba(232, 221, 236, 0.86)) !important;
+  box-shadow: 0 24px 76px rgba(79, 67, 101, 0.24) !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog > p,
+.chronicle-route-shell[data-theme="custom"] .seed-dialog article p,
+.chronicle-route-shell[data-theme="custom"] .seed-dialog .chronicle-empty p {
+  color: rgba(79, 67, 101, 0.68) !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog article {
+  border-color: rgba(166, 148, 188, 0.24) !important;
+  background: rgba(255, 255, 255, 0.50) !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog h3 {
+  color: #4f4365 !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog article i {
+  color: rgba(79, 67, 101, 0.66) !important;
+  opacity: 1 !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog footer button {
+  border-color: rgba(166, 148, 188, 0.24) !important;
+  color: #4f4365 !important;
+  background: rgba(255, 255, 255, 0.50) !important;
+}
+
+.chronicle-route-shell[data-theme="custom"] .seed-dialog footer button.chronicle-primary {
+  border-color: rgba(166, 148, 188, 0.50) !important;
+  color: #fbf9fc !important;
+  background: #a694bc !important;
+}
+
 .chronicle-route-shell[data-theme="custom"] .chronicle-entry-rail > button,
 .chronicle-route-shell[data-theme="custom"] .chronicle-entry-actions,
 .chronicle-route-shell[data-theme="custom"] .chronicle-reading-date strong,
@@ -15671,6 +15803,45 @@ textarea::-webkit-scrollbar-thumb {
       color-mix(in srgb, var(--kx-readable-gold) 92%, white 8%),
       color-mix(in srgb, var(--kx-readable-gold) 76%, #6f5636 24%)
     ) !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .chronicle-notice {
+  border-color: color-mix(in srgb, var(--kx-readable-gold) 38%, transparent) !important;
+  color: #2e2824 !important;
+  background:
+    radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--kx-readable-gold) 14%, transparent), transparent 34%),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.98), color-mix(in srgb, var(--kx-readable-gold) 9%, white 91%) 100%) !important;
+  box-shadow: 0 14px 38px rgba(143, 116, 78, 0.16) !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .chronicle-notice svg {
+  color: #2e2824 !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog > p,
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog article p,
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog .chronicle-empty p {
+  color: rgba(46, 40, 36, 0.66) !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog article {
+  border-color: color-mix(in srgb, var(--kx-readable-gold) 22%, transparent) !important;
+  background: rgba(255, 255, 255, 0.66) !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog h3,
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog footer button {
+  color: #2e2824 !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog article i {
+  color: color-mix(in srgb, var(--kx-readable-gold) 70%, #2e2824 30%) !important;
+  opacity: 1 !important;
+}
+
+.chronicle-route-shell[data-theme="white-gold"] .seed-dialog footer button.chronicle-primary {
+  color: #2e2824 !important;
+  background: color-mix(in srgb, var(--kx-readable-gold) 72%, white 28%) !important;
 }
 
 .chronicle-route-shell[data-theme] .chronicle-modal-close {

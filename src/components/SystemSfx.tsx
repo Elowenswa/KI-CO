@@ -8,12 +8,13 @@ const DEFAULT_SFX_VOLUME = 0.72;
 const VOLUME_CHANGE_EVENTS = ["ki-co-sfx-volume-changed", "xiaowu-sfx-volume-changed"];
 const INTERACTIVE_SELECTOR = "button, a[href], summary, [role=\"button\"], [data-sfx]";
 const HOVER_SELECTOR = "button:not(:disabled), a[href], summary, [role=\"button\"], [data-sfx]";
+const assetUrl = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, "")}`;
 
 const SFX_SOURCES: Record<SfxKind, string> = {
-  hover: "/cottage/audio/system/hover.wav",
-  confirm: "/cottage/audio/system/confirm.wav",
-  hotspot: "/cottage/audio/system/hotspot.wav",
-  error: "/cottage/audio/system/error.wav",
+  hover: assetUrl("cottage/audio/system/hover.wav"),
+  confirm: assetUrl("cottage/audio/system/confirm.wav"),
+  hotspot: assetUrl("cottage/audio/system/hotspot.wav"),
+  error: assetUrl("cottage/audio/system/error.wav"),
 };
 
 function readStoredVolume() {

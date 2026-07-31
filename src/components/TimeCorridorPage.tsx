@@ -38,7 +38,7 @@ import {
   recentChronicles,
   writeConversationChronicle,
 } from "../services/chronicleService";
-import { listConversations } from "../storage/conversations";
+import { ensureConversationStoreReady, listConversations } from "../storage/conversations";
 import { ChronicleBookGlyph, CottageDivider, CottageStar } from "./CottageGlyphs";
 
 interface TimeCorridorPageProps {
@@ -48,6 +48,20 @@ interface TimeCorridorPageProps {
 }
 
 type PageView = "months" | "entries" | "diary";
+
+function describeChronicleModelError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (/429|insufficient balance|no resource package|recharge/i.test(message)) {
+    return "日记/总结通道余额或资源包不足。请在系统设置里切换日记/总结模型，或给当前中转站账号充值后再试。";
+  }
+  if (/401|missing authentication|unauthorized|invalid api key/i.test(message)) {
+    return "日记/总结通道的 API Key 无效或未填写。请检查系统设置里的日记/总结通道。";
+  }
+  if (/403|forbidden|permission/i.test(message)) {
+    return "日记/总结通道没有当前模型权限，请换一个可用模型或检查中转站权限。";
+  }
+  return message || fallback;
+}
 
 function ContinuityVineGlyph({ size = 15 }: { size?: number }) {
   return (
@@ -127,6 +141,17 @@ function monthLabel(key: string): string {
   const month = Number(key.split("-")[1]);
   const monthNames = ["一月", "二月", "三月", "四月", "五月", "六月", "七月", "八月", "九月", "十月", "十一月", "十二月"];
   return monthNames[month - 1] || `${month}月`;
+}
+
+function filterSeedsByMonth(seeds: MemorySeed[], month: string, entries: ChronicleEntry[]): MemorySeed[] {
+  if (!month) return seeds;
+  const sourceIds = new Set(entries
+    .filter((entry) => monthKey(entry.createdAt) === month)
+    .map((entry) => entry.id));
+  return seeds.filter((seed) => (
+    seed.sourceChronicleIds.some((id) => sourceIds.has(id))
+    || seed.date.startsWith(month)
+  ));
 }
 
 function dateLabel(timestamp: number): string {
@@ -273,6 +298,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
   const [showComposer, setShowComposer] = useState(false);
   const [showContinuity, setShowContinuity] = useState(false);
   const [showSeeds, setShowSeeds] = useState(false);
+  const [seedScopeMonth, setSeedScopeMonth] = useState("");
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [preferences, setPreferences] = useState(() => getChroniclePreferences());
@@ -303,6 +329,9 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
   const activeDiaryTitleView = activeDiary ? getChronicleTitleView(activeDiary) : null;
   const activePersona = personaProfile.personas.find((persona) => persona.id === personaProfile.activePersonaId) || personaProfile.personas[0];
   const [selectedYearLabel = "", selectedMonthLabel = ""] = selectedMonth.split("-");
+  const pendingSeedCount = listMemorySeeds().length;
+  const selectedMonthSeedCount = filterSeedsByMonth(listMemorySeeds(), selectedMonth, entries).length;
+  const seedDialogTitle = seedScopeMonth ? `${monthLabel(seedScopeMonth)}核心回忆候选` : "待确认核心回忆候选";
 
   function openMonth(key: string) {
     setSelectedMonth(key);
@@ -313,6 +342,18 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
   function openDiary(id: string) {
     setActiveDiaryId(id);
     setView("diary");
+  }
+
+  function openSeedDialog(scopeMonth = "") {
+    const pending = listMemorySeeds();
+    setSeedScopeMonth(scopeMonth);
+    setSeeds(scopeMonth ? filterSeedsByMonth(pending, scopeMonth, entries) : pending);
+    setShowSeeds(true);
+  }
+
+  function refreshSeedDialog(scopeMonth = seedScopeMonth) {
+    const pending = listMemorySeeds();
+    setSeeds(scopeMonth ? filterSeedsByMonth(pending, scopeMonth, entries) : pending);
   }
 
   function deleteEntry(entry: ChronicleEntry) {
@@ -328,6 +369,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
   }
 
   async function generateLatestDiary() {
+    await ensureConversationStoreReady();
     const conversation = listConversations()[0];
     if (!conversation) { setNotice("还没有可整理的对话窗口。"); return; }
     setBusy("diary");
@@ -336,7 +378,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
       const entry = await writeConversationChronicle(llm, personaProfile, conversation, "manual");
       setNotice(entry ? `已写入「${getChronicleTitleView(entry).displayTitle}」。` : "当前对话内容还不足以写成日记。");
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "日记生成失败。");
+      setNotice(describeChronicleModelError(error, "日记生成失败。"));
     } finally {
       setBusy("");
     }
@@ -345,13 +387,42 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
   async function refineMemories() {
     const source = selectedMonth ? entries.filter((entry) => monthKey(entry.createdAt) === selectedMonth) : entries.slice(0, 30);
     if (!source.length) { setNotice("这个范围还没有日记可以提炼。"); return; }
+    const existingMonthSeeds = selectedMonth ? filterSeedsByMonth(listMemorySeeds(), selectedMonth, entries) : [];
+    if (existingMonthSeeds.length) {
+      const replaceOldSeeds = window.confirm(`${monthLabel(selectedMonth)}已有 ${existingMonthSeeds.length} 条待确认核心回忆候选。\n\n要先忽略旧候选，再重新提炼吗？`);
+      if (!replaceOldSeeds) {
+        openSeedDialog(selectedMonth);
+        return;
+      }
+      existingMonthSeeds.forEach((seed) => resolveMemorySeed(seed.id, "ignored"));
+      refreshSeedDialog(selectedMonth);
+    }
     setBusy("seeds");
+    setNotice("");
+    setShowSeeds(false);
     try {
-      await generateMemorySeeds(llm, personaProfile, source);
-      setSeeds(listMemorySeeds());
-      setShowSeeds(true);
+      const beforeIds = new Set(listMemorySeeds().map((seed) => seed.id));
+      const report = await generateMemorySeeds(llm, personaProfile, source);
+      const nextSeeds = selectedMonth ? filterSeedsByMonth(report.pendingSeeds, selectedMonth, entries) : report.pendingSeeds;
+      const freshSeeds = nextSeeds.filter((seed) => !beforeIds.has(seed.id));
+      const hasFreshSeed = freshSeeds.length > 0;
+      setSeedScopeMonth(selectedMonth || "");
+      setSeeds(freshSeeds);
+      if (hasFreshSeed) {
+        setShowSeeds(true);
+      } else if (!report.parsed) {
+        setNotice("日记模型没有按 JSON 返回，没能提炼出核心回忆候选。可以再试一次，或换一个更稳定的日记/总结模型。");
+      } else if (report.candidateCount === 0) {
+        setNotice(`这 ${source.length} 篇日记暂时没有整理出核心回忆候选。`);
+      } else if (report.validCandidateCount === 0) {
+        setNotice("模型返回了候选，但内容太短或格式不完整，未写入核心回忆候选。");
+      } else if (report.acceptedCount === 0) {
+        setNotice("模型返回的候选已经存在或被去重，未新增核心回忆候选。");
+      } else {
+        setNotice("这次没有提炼出新的核心回忆候选。");
+      }
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "回忆提炼失败。");
+      setNotice(describeChronicleModelError(error, "回忆提炼失败。"));
     } finally {
       setBusy("");
     }
@@ -365,7 +436,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
       await generateContinuityFromChronicles(llm, personaProfile, source, preferences.recentDays);
       setContinuityLine(getContinuityLine());
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "生活线提炼失败。");
+      setNotice(describeChronicleModelError(error, "生活线提炼失败。"));
     } finally {
       setBusy("");
     }
@@ -387,7 +458,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
       sourceTitle: seed.title,
     });
     resolveMemorySeed(seed.id, "stored");
-    setSeeds(listMemorySeeds());
+    refreshSeedDialog();
   }
 
   return (
@@ -399,6 +470,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
               <div className="chronicle-title-lockup"><ChronicleBookGlyph /><div><span className="chronicle-page-kicker">CHRONICLES</span><h1>时光回廊</h1><p>把日记、生活线和回忆种子留在这里，需要时再慢慢翻回。</p></div></div>
               <div className="chronicle-toolbar">
                 <button type="button" className="chronicle-continuity-button" onClick={() => setShowContinuity(true)}><ContinuityVineGlyph size={15} />跨窗接续</button>
+                {pendingSeedCount ? <button type="button" onClick={() => openSeedDialog()}><RefineStarGlyph size={15} />候选 {pendingSeedCount}</button> : null}
                 <button type="button" onClick={() => setShowComposer(true)}><FilePlus2 size={15} />手写</button>
               </div>
             </header>
@@ -441,6 +513,7 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
             <div className="chronicle-search-row">
               <label><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="在此卷中检索..." /></label>
               <button type="button" onClick={refineMemories} disabled={busy === "seeds"}>{busy === "seeds" ? <Loader2 className="chronicle-spin" size={15} /> : <RefineStarGlyph size={15} />}提炼回忆</button>
+              {selectedMonthSeedCount ? <button type="button" onClick={() => openSeedDialog(selectedMonth)}><RefineStarGlyph size={15} />本月候选 {selectedMonthSeedCount}</button> : null}
             </div>
             <div className="chronicle-entry-list">
               {monthEntries.map((entry, index) => {
@@ -496,8 +569,8 @@ export function TimeCorridorPage({ settings, personaProfile, llm }: TimeCorridor
       </section>
 
       {(showComposer || editingEntry) ? <DiaryEditor entry={editingEntry} onClose={() => { setShowComposer(false); setEditingEntry(null); }} /> : null}
-      {showContinuity ? <ContinuityDialog preferences={preferences} line={continuityLine} busy={busy} onClose={() => setShowContinuity(false)} onPreferences={(patch: Partial<typeof preferences>) => setPreferences(saveChroniclePreferences(patch))} onGenerate={refineContinuity} onLineChange={(content: string) => setContinuityLine(saveContinuityLine({ content }))} /> : null}
-      {showSeeds ? <SeedDialog seeds={seeds} onClose={() => setShowSeeds(false)} onStore={storeSeed} onIgnore={(seed) => { resolveMemorySeed(seed.id, "ignored"); setSeeds(listMemorySeeds()); }} /> : null}
+      {showContinuity ? <ContinuityDialog preferences={preferences} line={continuityLine} busy={busy} onClose={() => setShowContinuity(false)} onPreferences={(patch: Partial<typeof preferences>) => setPreferences(saveChroniclePreferences(patch))} onGenerate={refineContinuity} onLineChange={(content: string) => setContinuityLine(saveContinuityLine({ content }))} onOpenSeeds={() => openSeedDialog()} /> : null}
+      {showSeeds ? <SeedDialog title={seedDialogTitle} seeds={seeds} onClose={() => setShowSeeds(false)} onStore={storeSeed} onIgnore={(seed) => { resolveMemorySeed(seed.id, "ignored"); refreshSeedDialog(); }} /> : null}
     </main>
   );
 }
@@ -543,7 +616,7 @@ function DiaryEditor({ entry, onClose }: { entry: ChronicleEntry | null; onClose
   );
 }
 
-function ContinuityDialog({ preferences, line, busy, onClose, onPreferences, onGenerate, onLineChange }: any) {
+function ContinuityDialog({ preferences, line, busy, onClose, onPreferences, onGenerate, onLineChange, onOpenSeeds }: any) {
   const [pin, setPin] = useState("");
   const pendingSeedCount = listMemorySeeds().filter((seed) => seed.status === "pending").length;
   return (
@@ -604,15 +677,15 @@ function ContinuityDialog({ preferences, line, busy, onClose, onPreferences, onG
           ) : null}
         </div>
 
-        <div className="continuity-seed-foot">
-          <span>待确认回忆种子</span>
+        <button type="button" className="continuity-seed-foot" onClick={onOpenSeeds} disabled={!pendingSeedCount}>
+          <span>待确认核心候选</span>
           <strong>{pendingSeedCount}</strong>
-        </div>
+        </button>
       </div>
     </div>
   );
 }
 
-function SeedDialog({ seeds, onClose, onStore, onIgnore }: { seeds: MemorySeed[]; onClose: () => void; onStore: (seed: MemorySeed) => void; onIgnore: (seed: MemorySeed) => void }) {
-  return <div className="chronicle-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="chronicle-modal seed-dialog"><button className="chronicle-modal-close" onClick={onClose}><X size={18} /></button><h2>回忆种子</h2><p>这些只是候选，是否长期留下由你决定。</p><div>{seeds.map((seed) => <article key={seed.id}><span>{seed.date}</span><h3>{seed.title}</h3><p>{seed.content}</p><div>{seed.tags.map((tag) => <i key={tag}>#{tag}</i>)}</div><footer><button onClick={() => onIgnore(seed)}>忽略</button><button className="chronicle-primary" onClick={() => onStore(seed)}>存入记忆库</button></footer></article>)}{!seeds.length ? <div className="chronicle-empty compact"><p>暂时没有待确认的回忆种子。</p></div> : null}</div></div></div>;
+function SeedDialog({ title, seeds, onClose, onStore, onIgnore }: { title: string; seeds: MemorySeed[]; onClose: () => void; onStore: (seed: MemorySeed) => void; onIgnore: (seed: MemorySeed) => void }) {
+  return <div className="chronicle-modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="chronicle-modal seed-dialog"><button className="chronicle-modal-close" onClick={onClose}><X size={18} /></button><h2>{title}</h2><p>这是从本月日记里整理出的候选，是否长期留下由你决定。</p><div>{seeds.map((seed) => <article key={seed.id}><span>{seed.date}</span><h3>{seed.title}</h3><p>{seed.content}</p><div>{seed.tags.map((tag) => <i key={tag}>#{tag}</i>)}</div><footer><button onClick={() => onIgnore(seed)}>忽略</button><button className="chronicle-primary" onClick={() => onStore(seed)}>存入记忆库</button></footer></article>)}{!seeds.length ? <div className="chronicle-empty compact"><p>暂时没有待确认的核心回忆候选。</p></div> : null}</div></div></div>;
 }

@@ -44,15 +44,50 @@ function imageAttachments(attachments: ConversationAttachment[] = []): Conversat
   return attachments.filter((attachment) => attachment.type === "image" && attachment.dataUrl?.startsWith("data:image/"));
 }
 
-function imagesForModel(request: CompanionRequest, maxImages = 4): ConversationAttachment[] {
+const HISTORY_IMAGE_REFERENCE_PATTERN =
+  /(这张|那张|刚才.{0,8}(图|图片|照片|画面)|上一张|前面那张|图里|图片里|照片里|画面里|截图|构图|颜色|姿势|细节|看见|看到|看清|重画|改图|reference|image|picture|photo|screenshot)/i;
+
+interface ImageModelSelection {
+  currentImages: ConversationAttachment[];
+  historyImages: ConversationAttachment[];
+  allImages: ConversationAttachment[];
+}
+
+function shouldAttachHistoryImage(request: CompanionRequest): boolean {
+  if (request.mode === "plan" || request.channel === "journal") return false;
+  const text = String(request.userMessage || "").trim();
+  return HISTORY_IMAGE_REFERENCE_PATTERN.test(text);
+}
+
+function imagesForModel(request: CompanionRequest, maxImages = 4): ImageModelSelection {
   const currentImages = imageAttachments(request.attachments);
   const currentIds = new Set(currentImages.map((attachment) => attachment.id));
+  const historySlots = currentImages.length > 0 || request.watch?.screenshotDataUrl
+    ? 0
+    : shouldAttachHistoryImage(request)
+      ? 1
+      : 0;
   const recentImages = imageAttachments(
     request.recentMessages?.flatMap((message) => message.attachments ?? []) ?? [],
   ).filter((attachment) => !currentIds.has(attachment.id));
 
-  const roomForRecent = Math.max(0, maxImages - currentImages.length);
-  return [...recentImages.slice(-roomForRecent), ...currentImages].slice(-maxImages);
+  const historyImages = historySlots > 0 ? recentImages.slice(-historySlots) : [];
+  const allImages = [...historyImages, ...currentImages].slice(-maxImages);
+  return { currentImages, historyImages, allImages };
+}
+
+function appendVisualContextNote(text: string, selection: ImageModelSelection): string {
+  if (selection.historyImages.length === 0) return text;
+  return [
+    text,
+    "",
+    "[Historical visual context]",
+    "One recent image is attached only because the user appears to be referring to a previous picture. Treat it as background for that visual reference, not as the main topic unless the user's message asks about it.",
+  ].join("\n");
+}
+
+function visionFallbackInstruction(): string {
+  return "[Vision fallback]\nThe configured model or endpoint rejected image inputs. Continue with the text, image names, and attachment notes only. If the user asks you to inspect the image itself, say naturally that this model cannot read the image and suggest switching to a vision-capable model.";
 }
 
 function estimateTokens(text: string): number {
@@ -1079,6 +1114,7 @@ async function completeWithOpenAICompatible(
   // streaming partial tokens, and several compatible providers can split or
   // interleave structured output in ways that leave an incomplete JSON payload.
   const shouldStream = request.mode !== "plan" && settings.stream;
+  const selectedImages = imagesForModel(request, 4);
   const imageParts: any[] = [];
 
   if (settings.contextLoad.attachScreenshot && request.watch.screenshotDataUrl) {
@@ -1088,7 +1124,7 @@ async function completeWithOpenAICompatible(
     });
   }
 
-  for (const attachment of imagesForModel(request, 4)) {
+  for (const attachment of selectedImages.allImages) {
     imageParts.push({
       type: "image_url",
       image_url: { url: attachment.dataUrl },
@@ -1097,9 +1133,10 @@ async function completeWithOpenAICompatible(
 
   const hasImageInput = imageParts.length > 0;
   let includeImages = true;
+  let visionFallbackUsed = false;
 
   const buildUserContent = (text: string): any => {
-    const textPart = { type: "text", text };
+    const textPart = { type: "text", text: appendVisualContextNote(text, selectedImages) };
     const parts = includeImages ? [textPart, ...imageParts] : [textPart];
     return parts.length > 1 ? parts : text;
   };
@@ -1119,9 +1156,9 @@ async function completeWithOpenAICompatible(
                 cache_control: getClaudeCacheControl(claudeCacheTtl),
               }]
             : []),
-          { type: "text", text: promptCacheParts.dynamicTail },
+          { type: "text", text: appendVisualContextNote(promptCacheParts.dynamicTail, selectedImages) },
         ]
-      : [{ type: "text", text: promptPreview }];
+      : [{ type: "text", text: appendVisualContextNote(promptPreview, selectedImages) }];
     const parts = includeImages ? [...textParts, ...imageParts] : textParts;
     return parts.length > 1 ? parts : promptPreview;
   };
@@ -1219,7 +1256,8 @@ async function completeWithOpenAICompatible(
     }
     if (!response.ok && hasImageInput && shouldRetryWithoutImages(text)) {
       includeImages = false;
-      const fallbackText = "[Vision fallback]\nThe configured model or endpoint rejected image inputs. Continue with the text, image names, and attachment notes only. If the user asks you to inspect the image itself, say naturally that this model cannot read the image and suggest switching to a vision-capable model.";
+      visionFallbackUsed = true;
+      const fallbackText = visionFallbackInstruction();
       const fallbackBody = buildBody();
       fallbackBody.messages = useAutoStableSystemPrefix && autoStablePrefixParts
         ? [
@@ -1288,6 +1326,7 @@ async function completeWithOpenAICompatible(
       tokenCount: parsedUsage?.outputTokens || estimateTokens(streamed.text),
       thoughts: thoughts || undefined,
       thoughtsTranslated,
+      visionFallbackUsed,
     };
   }
 
@@ -1327,6 +1366,7 @@ async function completeWithOpenAICompatible(
     tokenCount: parsedUsage?.outputTokens || estimateTokens(extractTextFromOpenAICompatible(payload)),
     thoughts: thoughts || undefined,
     thoughtsTranslated,
+    visionFallbackUsed,
   };
 }
 
@@ -1360,11 +1400,14 @@ async function completeWithClaude(
     requestChannel: request.channel || "chat",
     cacheScope: request.cacheScope,
   });
-  const content: any[] = [{ type: "text", text: promptCacheParts?.dynamicTail || promptPreview }];
+  const selectedImages = imagesForModel(request, 4);
+  const content: any[] = [{ type: "text", text: appendVisualContextNote(promptCacheParts?.dynamicTail || promptPreview, selectedImages) }];
   const image = settings.contextLoad.attachScreenshot ? getDataUrlParts(request.watch.screenshotDataUrl) : null;
-  const attachedImages = imagesForModel(request, 4)
+  const attachedImages = selectedImages.allImages
     .map((attachment) => getDataUrlParts(attachment.dataUrl))
     .filter(Boolean) as Array<{ mediaType: string; data: string }>;
+  const hasImageInput = !!image || attachedImages.length > 0;
+  let visionFallbackUsed = false;
 
   if (image) {
     content.push({
@@ -1394,7 +1437,7 @@ async function completeWithClaude(
     "Content-Type": "application/json",
   };
   const endpoint = `${trimTrailingSlash(profile.baseUrl)}/messages`;
-  const buildBody = () => ({
+  const buildBody = (messageContent = content) => ({
       model: profile.model,
       max_tokens: maxOutputTokens,
       temperature,
@@ -1416,7 +1459,7 @@ async function completeWithClaude(
             ],
           }
         : {}),
-      messages: [{ role: "user", content }],
+      messages: [{ role: "user", content: messageContent }],
   });
 
   let rawResponse = await fetch(endpoint, {
@@ -1430,11 +1473,23 @@ async function completeWithClaude(
   if (!rawResponse.ok && useClaudePromptCache && shouldRetryWithoutPromptCache(rawText)) {
     useClaudePromptCache = false;
     promptCacheSkipReason = "retry_without_cache_control";
-    content[0] = { type: "text", text: promptPreview };
+    content[0] = { type: "text", text: appendVisualContextNote(promptPreview, selectedImages) };
     rawResponse = await fetch(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(buildBody()),
+      signal: request.signal,
+    });
+    rawText = await rawResponse.text();
+  }
+
+  if (!rawResponse.ok && hasImageInput && shouldRetryWithoutImages(rawText)) {
+    visionFallbackUsed = true;
+    const fallbackContent = [{ type: "text", text: `${promptPreview}\n\n${visionFallbackInstruction()}` }];
+    rawResponse = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(buildBody(fallbackContent)),
       signal: request.signal,
     });
     rawText = await rawResponse.text();
@@ -1486,6 +1541,7 @@ async function completeWithClaude(
     tokenCount: parsedUsage?.outputTokens || undefined,
     thoughts: thoughts || undefined,
     thoughtsTranslated,
+    visionFallbackUsed,
   };
 }
 
@@ -1499,9 +1555,10 @@ async function completeWithGemini(
     ? Number(request.temperatureOverride)
     : settings.temperature;
   const maxOutputTokens = getMaxOutputTokens(settings, request);
-  const parts: any[] = [{ text: promptPreview }];
+  const selectedImages = imagesForModel(request, 4);
+  const parts: any[] = [{ text: appendVisualContextNote(promptPreview, selectedImages) }];
   const image = settings.contextLoad.attachScreenshot ? getDataUrlParts(request.watch.screenshotDataUrl) : null;
-  const attachedImages = imagesForModel(request, 4)
+  const attachedImages = selectedImages.allImages
     .map((attachment) => getDataUrlParts(attachment.dataUrl))
     .filter(Boolean) as Array<{ mediaType: string; data: string }>;
 
@@ -1524,18 +1581,34 @@ async function completeWithGemini(
   }
 
   const endpoint = `${trimTrailingSlash(profile.baseUrl)}/models/${encodeURIComponent(profile.model)}:generateContent?key=${encodeURIComponent(profile.apiKey)}`;
-  const payload = await requestJson(endpoint, {
+  const buildGeminiBody = (requestParts = parts) => JSON.stringify({
+    contents: [{ role: "user", parts: requestParts }],
+    generationConfig: {
+      temperature,
+      maxOutputTokens,
+    },
+  });
+  let visionFallbackUsed = false;
+  let payload: any;
+  try {
+    payload = await requestJson(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: buildGeminiBody(),
+      signal: request.signal,
+    });
+  } catch (error) {
+    if (!(image || attachedImages.length) || !shouldRetryWithoutImages(error instanceof Error ? error.message : String(error))) {
+      throw error;
+    }
+    visionFallbackUsed = true;
+    payload = await requestJson(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        temperature,
-        maxOutputTokens,
-      },
-    }),
+      body: buildGeminiBody([{ text: `${promptPreview}\n\n${visionFallbackInstruction()}` }]),
     signal: request.signal,
-  });
+    });
+  }
 
   const text = payload?.candidates?.[0]?.content?.parts
     ?.map((part: any) => part?.text || "")
@@ -1555,6 +1628,7 @@ async function completeWithGemini(
     promptPreview,
     modelUsed: profile.model,
     tokenCount: parsedUsage?.outputTokens || estimateTokens(text || ""),
+    visionFallbackUsed,
   };
 }
 
