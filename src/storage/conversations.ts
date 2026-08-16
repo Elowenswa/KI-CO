@@ -3,6 +3,8 @@ import { slugifyTitle } from "../utils/time";
 import { imageDB } from "../utils/imageDB";
 
 const STORAGE_KEY = "kisera_cinema_conversations_v1";
+const CONVERSATION_DRAFT_STORAGE_KEY = "kico_conversation_drafts_v1";
+const ACTIVE_CONVERSATION_STORAGE_KEY = "kico_active_conversation_v1";
 const CONVERSATION_STORE_DB_NAME = "kisera_cottage_conversation_store_v1";
 const CONVERSATION_STORE_NAME = "kv";
 const CONVERSATION_STORE_LIST_ID = "conversations";
@@ -116,6 +118,7 @@ function normalizeConversationMessage(raw: any, index: number): ConversationMess
   return {
     id: String(raw.id || `import-message-${Date.now()}-${index}`),
     role: normalizeRole(raw.role),
+    kind: raw.kind === "archive-preview" || raw.kind === "resurrection" ? raw.kind : undefined,
     text,
     createdAt: toIso(timestamp, Date.now() + index),
     attachments: attachments.length ? attachments as ConversationMessage["attachments"] : undefined,
@@ -124,6 +127,56 @@ function normalizeConversationMessage(raw: any, index: number): ConversationMess
     thoughts: typeof raw.thoughts === "string" ? raw.thoughts : undefined,
     thoughtsTranslated: typeof raw.thoughtsTranslated === "string" ? raw.thoughtsTranslated : undefined,
   };
+}
+
+export function readConversationDrafts(): Record<string, string> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CONVERSATION_DRAFT_STORAGE_KEY) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function writeConversationDrafts(drafts: Record<string, string>) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(CONVERSATION_DRAFT_STORAGE_KEY, JSON.stringify(drafts));
+  } catch (error) {
+    console.warn("Failed to persist conversation drafts", error);
+  }
+}
+
+export function readConversationDraft(conversationId: string): string {
+  return readConversationDrafts()[conversationId] || "";
+}
+
+export function persistConversationDraft(conversationId: string, draft: string) {
+  if (!conversationId) return;
+  const drafts = readConversationDrafts();
+  if (draft.trim()) drafts[conversationId] = draft;
+  else delete drafts[conversationId];
+  writeConversationDrafts(drafts);
+}
+
+export function readActiveConversationId(conversations: ConversationRecord[]) {
+  if (typeof localStorage === "undefined") return "";
+  try {
+    const id = localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY) || "";
+    return conversations.some((conversation) => conversation.id === id) ? id : "";
+  } catch {
+    return "";
+  }
+}
+
+export function persistActiveConversationId(conversationId: string) {
+  if (typeof localStorage === "undefined" || !conversationId) return;
+  try {
+    localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, conversationId);
+  } catch (error) {
+    console.warn("Failed to persist active conversation", error);
+  }
 }
 
 export function normalizeConversationRecord(raw: any, index = 0): ConversationRecord | null {

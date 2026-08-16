@@ -99,8 +99,22 @@ type ClaudeResolvedCacheTtl = "5m" | "1h";
 const CLAUDE_DEFAULT_CACHE_CONTROL = { type: "ephemeral" } as const;
 const CLAUDE_DEFAULT_MIN_CACHE_TOKENS = 1024;
 const CLAUDE_AUTO_LONG_GAP_MS = 8 * 60 * 1000;
+const GROK_CONVERSATION_ID_MAX_LENGTH = 128;
 
 const claudeAutoTtlLocks = new Map<string, { ttl: ClaudeResolvedCacheTtl; updatedAt: number }>();
+
+function isGrokModel(model = ""): boolean {
+  return /\b(?:x-ai|grok)\b/i.test(model);
+}
+
+function buildStableGrokConversationId(scope: string | undefined, model: string): string {
+  const raw = `${scope || "global-chat"}:${model || "model"}`
+    .trim()
+    .replace(/[^a-zA-Z0-9._:-]+/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, GROK_CONVERSATION_ID_MAX_LENGTH);
+  return raw || "global-chat";
+}
 
 function getClaudeCacheControl(ttl: ClaudeResolvedCacheTtl) {
   return ttl === "1h" ? { type: "ephemeral", ttl: "1h" } as const : CLAUDE_DEFAULT_CACHE_CONTROL;
@@ -480,6 +494,16 @@ export function buildCompanionPrompt(request: CompanionRequest): string {
     }
 
     if (request.purpose === "session-state") {
+      return [
+        request.personaCore,
+        request.userContext,
+        request.userMessage,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+    }
+
+    if (request.purpose === "archive-resurrection") {
       return [
         request.personaCore,
         request.userContext,
@@ -1050,10 +1074,15 @@ async function completeWithOpenAICompatible(
   const cacheProvider = resolvePromptCacheProvider(provider, profile);
   const promptCacheParts = buildClaudePromptCachePlan(request, promptPreview, profile.model);
   const isClaudeLike = isClaudeLikeProfile(provider, profile);
+  const isGrokLike = isGrokModel(profile.model);
   const autoStablePrefixParts = !isClaudeLike ? splitPromptForClaudeCache(request, promptPreview) : null;
   const claudeCacheTtl = resolveClaudeCacheTtl(settings, request);
   const openRouterSessionId = provider === "openrouter"
     ? String(request.cacheScope || "").trim().slice(0, 256)
+    : "";
+  const shouldSendGrokConversationHeader = isGrokLike && /api\.x\.ai/i.test(profile.baseUrl);
+  const grokConversationId = shouldSendGrokConversationHeader
+    ? buildStableGrokConversationId(request.cacheScope, profile.model)
     : "";
   let useClaudePromptCache = provider === "openrouter" && isClaudeLike && !!promptCacheParts;
   let useAutoStableSystemPrefix = !useClaudePromptCache && !!autoStablePrefixParts;
@@ -1071,12 +1100,14 @@ async function completeWithOpenAICompatible(
       ? useClaudePromptCache
         ? "anthropic_explicit"
         : "anthropic_compatible_no_cache"
+      : isGrokLike
+        ? "grok_auto"
       : cacheProvider === "openai"
         ? "openai_auto"
         : "provider_auto_or_unknown",
     cacheControlUsed: useClaudePromptCache,
     cacheControlTtl: useClaudePromptCache ? formatClaudeCacheTtlForDebug(claudeCacheTtl) : undefined,
-    cacheControlSkipReason: useClaudePromptCache ? undefined : useAutoStableSystemPrefix ? "auto_cache_no_control" : promptCacheSkipReason,
+    cacheControlSkipReason: useClaudePromptCache ? undefined : useAutoStableSystemPrefix ? "auto_cache_no_control" : isGrokLike ? "grok_auto_cache" : promptCacheSkipReason,
     cacheStrategy: useClaudePromptCache
       ? promptCacheParts?.cacheStrategy
       : useAutoStableSystemPrefix
@@ -1202,11 +1233,14 @@ async function completeWithOpenAICompatible(
     return body;
   };
 
-  const headers = {
+  const headers: Record<string, string> = {
     Authorization: `Bearer ${profile.apiKey}`,
     "Content-Type": "application/json",
     ...openRouterAppHeadersForBase(profile.baseUrl),
   };
+  if (grokConversationId) {
+    headers["x-grok-conv-id"] = grokConversationId;
+  }
 
   let requestBody = buildBody();
   let response = await fetch(endpoint, {

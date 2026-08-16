@@ -113,6 +113,29 @@ export function captureWindowHandoff(
   return handoff;
 }
 
+export function captureResurrectionHandoff(
+  targetSessionId: string,
+  content: string,
+  sourceSessionId = "archive-resurrection",
+): WindowHandoff | null {
+  const cleanContent = String(content || "").trim();
+  if (!targetSessionId || !cleanContent) return null;
+  const store = readStore();
+  const now = Date.now();
+  const handoff: WindowHandoff = {
+    id: `resurrection-${now}-${Math.random().toString(36).slice(2, 7)}`,
+    sourceSessionId,
+    targetSessionId,
+    content: cleanContent.slice(0, 4200),
+    includeContinuityLine: true,
+    createdAt: now,
+    expiresAt: now + 24 * 60 * 60 * 1000,
+  };
+  store.handoffs[targetSessionId] = handoff;
+  writeStore(store);
+  return handoff;
+}
+
 export function getWindowHandoff(targetSessionId?: string | null): WindowHandoff | null {
   if (!targetSessionId) return null;
   const store = readStore();
@@ -197,7 +220,11 @@ function messageSpeaker(message: ConversationMessage, profile: PersonaProfile, p
 }
 
 function conversationMessages(messages: ConversationMessage[]): ConversationMessage[] {
-  return messages.filter((message) => messageText(message));
+  return messages.filter((message) => (
+    messageText(message)
+    && message.kind !== "archive-preview"
+    && message.kind !== "resurrection"
+  ));
 }
 
 const TOPIC_SHIFT_PATTERNS = [

@@ -129,7 +129,7 @@ const DEFAULT_PROFILES: Record<ModelProvider, ProviderProfile> = {
 };
 
 const DEFAULT_VISUAL_SETTINGS: VisualAtmosphereSettings = {
-  theme: "white-gold",
+  theme: "custom",
   backgroundFit: "stage",
   customBackgroundDataUrl: "",
   fontStyle: "system",
@@ -175,7 +175,7 @@ export const DEFAULT_MEMORY_RETRIEVAL_SETTINGS: MemoryRetrievalSettings = {
   vectorContextBudgetChars: 2500,
   latestStyleEnabled: false,
   latestStyleTopK: 2,
-  latestStylePathKeyword: "风格样本库",
+  latestStylePathKeyword: "原文样本库",
   obsidianScopeMode: "all",
   obsidianScopeCustom: "",
 };
@@ -218,7 +218,7 @@ function normalizeFontStyle(value: unknown): VisualAtmosphereSettings["fontStyle
 }
 
 function normalizeTheme(value: unknown): VisualAtmosphereSettings["theme"] {
-  return value === "black-gold" || value === "pink-mocha" || value === "custom" ? value : "white-gold";
+  return value === "black-gold" || value === "white-gold" || value === "pink-mocha" || value === "custom" ? value : "custom";
 }
 
 function normalizeJournalProvider(value: unknown): JournalProvider {
@@ -293,6 +293,7 @@ function normalizeMemoryRetrievalSettings(raw: Partial<MemoryRetrievalSettings> 
     rawMemoryWindowLimit: Math.max(1, Math.min(12, Math.floor(Number(merged.rawMemoryWindowLimit) || 2))),
     vectorContextBudgetChars: Math.max(600, Math.min(12000, Math.floor(Number(merged.vectorContextBudgetChars) || 2500))),
     latestStyleTopK: latestTopK,
+    latestStylePathKeyword: String(merged.latestStylePathKeyword || DEFAULT_MEMORY_RETRIEVAL_SETTINGS.latestStylePathKeyword),
     obsidianScopeMode: normalizeObsidianScopeMode(merged.obsidianScopeMode),
     obsidianScopeCustom: String(merged.obsidianScopeCustom || ""),
   };

@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { Clapperboard, Hourglass, MessageCircle, Settings, SlidersHorizontal, UserRound } from "lucide-react";
+import { Heart, Hourglass, MessageCircle, Settings, SlidersHorizontal, UserRound } from "lucide-react";
 import type { ComponentType } from "react";
 import { createConfiguredLLMAdapter, createMemoryBankAdapter } from "./adapters/companionAdapters";
+import { BondSpacePage } from "./components/BondSpacePage";
 import { ChatPage } from "./components/chat/ChatPage";
 import { CinemaCompanionRoom } from "./components/CinemaCompanionRoom";
 import { CottageLogoMark } from "./components/CottageGlyphs";
 import { MemoryBankPage } from "./components/MemoryBankPage";
+import { MemoryGalleryPage } from "./components/MemoryGalleryPage";
 import { PersonaCorePage } from "./components/PersonaCorePage";
 import { SettingsPage } from "./components/SettingsPage";
 import { SystemSfx } from "./components/SystemSfx";
@@ -16,7 +18,7 @@ import { createFullBackup, downloadBackup, recordFullBackupPrompt, shouldPromptF
 import { getActivePersona, loadPersonaProfile, savePersonaProfile, type PersonaProfile } from "./storage/personaProfile";
 import type { UplinkSettings } from "./types";
 
-type AppPage = "cinema" | "chat" | "settings" | "persona" | "memory" | "chronicle" | "vector";
+type AppPage = "bond" | "cinema" | "memoryGallery" | "chat" | "settings" | "persona" | "memory" | "chronicle" | "vector";
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -49,11 +51,11 @@ function NavMemoryGlyph({ size = 20, className = "" }: { size?: number; classNam
 }
 
 const ROUTE_ITEMS: Array<{ page: AppPage; label: string; icon: ComponentType<{ size?: number; className?: string }> }> = [
+  { page: "bond", label: "羁绊空间", icon: Heart },
   { page: "chat", label: "长对话", icon: MessageCircle },
   { page: "persona", label: "人格核", icon: UserRound },
   { page: "memory", label: "记忆库", icon: NavMemoryGlyph },
   { page: "chronicle", label: "时光回廊", icon: Hourglass },
-  { page: "cinema", label: "观影室", icon: Clapperboard },
   { page: "vector", label: "调音台", icon: SlidersHorizontal },
   { page: "settings", label: "设置", icon: Settings },
 ];
@@ -75,11 +77,12 @@ function RouteSwitcher({
       </span>
       {ROUTE_ITEMS.map((item) => {
         const Icon = item.icon;
+        const isActive = activePage === item.page || (item.page === "bond" && (activePage === "cinema" || activePage === "memoryGallery"));
         return (
           <button
             key={item.page}
             type="button"
-            className={`${activePage === item.page ? "active" : ""} route-${item.page}`.trim()}
+            className={`${isActive ? "active" : ""} route-${item.page}`.trim()}
             onClick={() => onSelect(item.page)}
             title={item.label}
             aria-label={item.label}
@@ -96,7 +99,7 @@ function RouteSwitcher({
 export default function App() {
   const [personaProfile, setPersonaProfileState] = useState<PersonaProfile>(() => loadPersonaProfile());
   const [uplinkSettings, setUplinkSettingsState] = useState<UplinkSettings>(() => loadUplinkSettings());
-  const [activePage, setActivePage] = useState<AppPage>("cinema");
+  const [activePage, setActivePage] = useState<AppPage>("bond");
   const [initialConversationId, setInitialConversationId] = useState<string | undefined>(undefined);
   const [installPromptEvent, setInstallPromptEvent] = useState<BeforeInstallPromptEvent | null>(null);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
@@ -239,6 +242,7 @@ export default function App() {
         <CinemaCompanionRoom
           adapters={adapters}
           uplinkSettings={effectiveUplinkSettings}
+          isActive={activePage === "cinema"}
           onOpenLongChat={() => {
             setInitialConversationId(undefined);
             setActivePage("chat");
@@ -256,6 +260,26 @@ export default function App() {
       </div>
 
       <RouteSwitcher activePage={activePage} theme={uplinkSettings.visual.theme} onSelect={goToPage} />
+
+      {activePage === "bond" && (
+        <BondSpacePage
+          settings={uplinkSettings}
+          onOpenCinema={() => setActivePage("cinema")}
+          onOpenMemoryGallery={() => setActivePage("memoryGallery")}
+        />
+      )}
+
+      {activePage === "memoryGallery" && (
+        <MemoryGalleryPage
+          settings={effectiveUplinkSettings}
+          personaProfile={personaProfile}
+          llm={adapters.llm}
+          onOpenConversation={(conversationId) => {
+            setInitialConversationId(conversationId);
+            setActivePage("chat");
+          }}
+        />
+      )}
 
       {showInstallBanner ? (
         <div className="cottage-install-banner" data-theme={uplinkSettings.visual.theme}>

@@ -175,7 +175,7 @@ export interface MemoryAdapter {
 export interface CompanionRequest {
   mode?: "cinema" | "chat" | "plan" | "watchPrompt";
   channel?: "chat" | "journal";
-  purpose?: "topic-recall-judge" | "session-state";
+  purpose?: "topic-recall-judge" | "session-state" | "archive-resurrection";
   cacheScope?: string;
   userMessage: string;
   attachments?: ConversationAttachment[];
@@ -237,6 +237,7 @@ export interface CompanionPlanPoint {
 export interface ConversationMessage {
   id: string;
   role: "user" | "companion";
+  kind?: "normal" | "archive-preview" | "resurrection";
   text: string;
   createdAt: string;
   attachments?: ConversationAttachment[];

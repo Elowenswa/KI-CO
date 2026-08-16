@@ -50,7 +50,16 @@ import {
 } from "../../storage/conversations";
 import { selectCacheFriendlyWindow } from "../../utils/contextWindow";
 import { shouldRetrieveMemory } from "../../utils/memoryRecallGate";
-import { recordContextRetrievalAction, recordContextRetrievalResult, recordContextRetrievalSkip, retrieveMemorySnippetsDetailed, type ContextRetrievalMeta } from "../../storage/memoryBank";
+import {
+  attachLatestStyleTraceToLatestTurn,
+  detectLatestStyleScene,
+  recordContextRetrievalAction,
+  recordContextRetrievalResult,
+  recordContextRetrievalSkip,
+  retrieveLatestStyleExamplesDetailed,
+  retrieveMemorySnippetsDetailed,
+  type ContextRetrievalMeta,
+} from "../../storage/memoryBank";
 import {
   applyTopicRecallJudgement,
   buildMemoryRetrievalQuery,
@@ -71,6 +80,7 @@ import {
 } from "../../utils/topicMemoryGate";
 import { buildTimeAwarenessContext, buildTimeBridgeMeta } from "../../utils/timeAwareness";
 import { MarkdownText } from "../MarkdownText";
+import { CottageLogoMark } from "../CottageGlyphs";
 import { getChronicleWriteIntent, getContinuityContext, maybeWriteChronicleAfterTurn } from "../../services/chronicleService";
 import { judgeTopicRecallWithJournalModel } from "../../services/topicRecallJudge";
 import { getChroniclePreferences, getContinuityLine } from "../../storage/chronicles";
@@ -253,6 +263,27 @@ function createEmptyWatchContext() {
     sourceType: "local-file" as const,
     subtitleWindow: { previous: [], next: [] },
   };
+}
+
+function buildLatestStyleReferenceContext(options: {
+  sceneId: string;
+  sceneLabel: string;
+  companionName: string;
+  snippets: MemorySnippet[];
+}): string {
+  if (!options.snippets.length) return "";
+  const lines = options.snippets.map((snippet, index) => {
+    const text = String(snippet.text || "").replace(/\s+/g, " ").trim();
+    return `[Style Example ${index + 1} | scene=${options.sceneId}]
+Title: ${snippet.title || "Untitled"}
+Excerpt: ${text}`;
+  });
+  return `=== [LAYER: LATEST STYLE REFERENCES] ===
+[Scene]: ${options.sceneId} / ${options.sceneLabel}
+[Source]: ${options.companionName || "AI"} style library
+These are historical ${options.companionName || "AI"} style references for a similar context.
+这些样本是回家的路标，不是必须戴上的面具。参考它们的节奏和亲密感，但不要机械复刻；如果此刻的判断、状态或事实与样本不同，要诚实地留在当下。
+${lines.join("\n\n")}`;
 }
 
 function formatConversationDate(value: string) {
@@ -522,6 +553,19 @@ function cloneAttachments(attachments: ConversationAttachment[] = []) {
   return attachments.map((attachment) => ({ ...attachment }));
 }
 
+function isPromptConversationMessage(message: ConversationMessage): boolean {
+  return message.kind !== "archive-preview" && message.kind !== "resurrection";
+}
+
+function buildResurrectionContext(messages: ConversationMessage[]): string {
+  const beacon = messages.find((message) => message.kind === "resurrection" && message.text.trim());
+  if (!beacon) return "";
+  return `这是当前唤醒窗口的常驻记忆信标。它是从导入的旧窗口里提炼出的固定接续锚点，不是当前正在发生的事件，也不是必须复述的台词。
+当前事实以用户当下表达、Time Bridge 和最近对话为准；如果信标与当前表达冲突，优先听用户现在说的话。
+
+${beacon.text.trim()}`;
+}
+
 export function ChatPage({
   adapters,
   uplinkSettings,
@@ -714,8 +758,12 @@ export function ChatPage({
 
   const messages = activeConversation?.messages ?? [];
   const visibleMessageCount = visibleMessageCountByConversation[activeId] ?? INITIAL_VISIBLE_MESSAGE_COUNT;
-  const hiddenMessageCount = Math.max(0, messages.length - visibleMessageCount);
-  const visibleMessages = hiddenMessageCount > 0 ? messages.slice(hiddenMessageCount) : messages;
+  const foldableMessages = messages.filter((message) => message.kind !== "resurrection");
+  const hiddenMessageCount = Math.max(0, foldableMessages.length - visibleMessageCount);
+  const hiddenFoldableIds = new Set(foldableMessages.slice(0, hiddenMessageCount).map((message) => message.id));
+  const visibleMessages = hiddenMessageCount > 0
+    ? messages.filter((message) => message.kind === "resurrection" || !hiddenFoldableIds.has(message.id))
+    : messages;
 
   useEffect(() => {
     let cancelled = false;
@@ -1012,7 +1060,7 @@ export function ChatPage({
 
   function makeRecentContext(conversation?: ConversationRecord) {
     if (!conversation) return "";
-    return selectCacheFriendlyWindow(conversation.messages, uplinkSettings.contextLoad.shortTermMessageLimit)
+    return selectCacheFriendlyWindow(conversation.messages.filter(isPromptConversationMessage), uplinkSettings.contextLoad.shortTermMessageLimit)
       .map((message) => `${message.role === "user" ? "User" : "AI"}：${message.text}`)
       .join("\n")
       .slice(0, 900);
@@ -1323,6 +1371,7 @@ export function ChatPage({
     let memories: MemorySnippet[] = replaySnapshot
       ? replaySnapshot.memories.map((memory) => ({ ...memory }))
       : [];
+    let latestStyleSkipReason = "";
     if (replaySnapshot) {
       if (memories.length) {
         recordContextRetrievalAction(
@@ -1355,6 +1404,13 @@ export function ChatPage({
         recallGatePassed,
         hasAttachments: attachments.length > 0,
       }, existingSet);
+      if (
+        gate.ragAction === "none"
+        && (gate.ragSkippedBecauseLowSemantic || gate.ragSkippedBecauseIntimateContinuation)
+        && baseMessages.length >= 2
+      ) {
+        latestStyleSkipReason = "natural_continuation_with_recent_context";
+      }
       const topicSetsForScope = getTopicMemorySets(topicScope);
       let topicSetRestoreDebug: ContextRetrievalMeta = {
         topicMemorySetRestored: false,
@@ -1478,7 +1534,7 @@ export function ChatPage({
         const state = getTopicJudgeThrottleState(topicScope);
         const previousAssistant = [...baseMessages]
           .reverse()
-          .find((message) => message.role === "companion" && message.text.trim());
+          .find((message) => message.role === "companion" && isPromptConversationMessage(message) && message.text.trim());
         const judgement = await judgeTopicRecallWithJournalModel(adapters.llm, {
           cacheScope: topicScope,
           userMessage: userText,
@@ -1595,6 +1651,9 @@ export function ChatPage({
     const continuityContext = handoff?.includeContinuityLine === false
       ? ""
       : getContinuityContext(personaProfile?.userName || "User");
+    const resurrectionContext = activeConversation
+      ? buildResurrectionContext(activeConversation.messages)
+      : "";
     const currentStateCard = getSessionStateCard(activeConversation?.id);
     const stateCardContext = currentStateCard?.enabled && currentStateCard.visibleToPersona && currentStateCard.content.trim()
       ? `这是一张当前窗口的共同便签，不是审讯记录，也不是必须复刻的脚本。
@@ -1613,25 +1672,87 @@ ${currentStateCard.content.trim()}`
       ? `这是上一窗口刚刚聊到的位置，只在这次接续时参考：\n${handoff.content}`
       : "";
     const assembledUserContext = replaySnapshot?.assembledUserContext
-      ?? [userContext, continuityContext, stateCardContext, handoffContext].filter(Boolean).join("\n\n");
+      ?? [userContext, resurrectionContext, continuityContext, stateCardContext, handoffContext].filter(Boolean).join("\n\n");
     const filteredMemories = replaySnapshot
       ? replaySnapshot.memories.map((memory) => ({ ...memory }))
       : filterPersonaMemories(memories, personaAllowsMemory, personaAllowsChronicles);
+    const latestStyleEnabled = !replaySnapshot
+      && chroniclePreferences.enableMemoryRecall
+      && personaAllowsMemory
+      && uplinkSettings.memoryRetrieval.enableObsidianRetrieval !== false
+      && uplinkSettings.memoryRetrieval.latestStyleEnabled === true;
+    let latestStyleContext = "";
+    if (latestStyleEnabled) {
+      const pathKeyword = (uplinkSettings.memoryRetrieval.latestStylePathKeyword || "原文样本库").trim() || "原文样本库";
+      const topK = Math.max(1, Math.min(5, Number(uplinkSettings.memoryRetrieval.latestStyleTopK || 2)));
+      if (latestStyleSkipReason) {
+        attachLatestStyleTraceToLatestTurn({
+          enabled: true,
+          scene: "natural_continuation / 自然延续",
+          pathKeyword,
+          recallCount: 0,
+          injectedCount: 0,
+          usedChars: 0,
+          skipReason: latestStyleSkipReason,
+          items: [],
+        });
+      } else {
+        const scene = detectLatestStyleScene(userText, baseMessages.map((message) => ({ text: message.text })));
+        try {
+          const result = await retrieveLatestStyleExamplesDetailed(
+            scene.query,
+            scene.id,
+            topK,
+            uplinkSettings,
+            `${topicScope}:latest-style:${scene.id}`,
+          );
+          latestStyleContext = buildLatestStyleReferenceContext({
+            sceneId: scene.id,
+            sceneLabel: scene.label,
+            companionName: activePersona?.name || "Ta",
+            snippets: result.snippets,
+          });
+          attachLatestStyleTraceToLatestTurn({
+            enabled: true,
+            scene: `${scene.id} / ${scene.label}`,
+            pathKeyword,
+            recallCount: result.recallCount,
+            injectedCount: result.snippets.length,
+            usedChars: result.usedChars,
+            items: result.snippets,
+          });
+        } catch (error) {
+          attachLatestStyleTraceToLatestTurn({
+            enabled: true,
+            scene: `${scene.id} / ${scene.label}`,
+            pathKeyword,
+            recallCount: 0,
+            injectedCount: 0,
+            usedChars: 0,
+            error: error instanceof Error ? error.message : "原文样本库召回失败",
+            items: [],
+          });
+        }
+      }
+    }
+    const timeBridgeMessages = baseMessages.filter((message) => message.kind !== "resurrection");
     const timeBridgeOptions = {
-      messages: baseMessages,
+      messages: timeBridgeMessages,
       stateCard: currentStateCard,
       continuityLine: handoff?.includeContinuityLine === false ? null : getContinuityLine(),
       memories: filteredMemories,
       memoryRecallEnabled: chroniclePreferences.enableMemoryRecall && personaAllowsMemory,
       chronicleRecallEnabled: chroniclePreferences.enableMemoryRecall && personaAllowsChronicles,
     };
-    const dynamicContext = replaySnapshot?.dynamicContext
+    const baseDynamicContext = replaySnapshot?.dynamicContext
       ?? buildTimeAwarenessContext(uplinkSettings, timeBridgeOptions, timeBridgeNow || new Date());
+    const dynamicContext = replaySnapshot?.dynamicContext
+      ?? [latestStyleContext, baseDynamicContext].filter(Boolean).join("\n\n");
     const timeBridgeMeta = replaySnapshot?.timeBridgeMeta
       ? { ...replaySnapshot.timeBridgeMeta }
       : buildTimeBridgeMeta(timeBridgeOptions);
 
-    const recentMessages = selectCacheFriendlyWindow(baseMessages, uplinkSettings.contextLoad.shortTermMessageLimit)
+    const recentMessages = selectCacheFriendlyWindow(baseMessages.filter(isPromptConversationMessage), uplinkSettings.contextLoad.shortTermMessageLimit)
       .map((message) => ({
         role: message.role,
         text: message.text,
@@ -2376,12 +2497,46 @@ ${currentStateCard.content.trim()}`
           )}
 
           {visibleMessages.map((message) => (
+            message.kind === "resurrection" ? (() => {
+              const closedKey = `resurrection:${message.id}:closed`;
+              const isOpen = !openReasoningIds.has(closedKey);
+              const setOpen = (open: boolean) => {
+                setOpenReasoningIds((current) => {
+                  const next = new Set(current);
+                  if (open) next.delete(closedKey);
+                  else next.add(closedKey);
+                  return next;
+                });
+              };
+              return (
+                <article
+                  key={message.id}
+                  ref={(node) => {
+                    messageRefs.current[message.id] = node;
+                  }}
+                  className={`cottage-resurrection-beacon ${isOpen ? "is-open" : ""} ${highlightMessageId === message.id ? "search-highlight" : ""}`}
+                >
+                  <button type="button" className="cottage-resurrection-summary" onClick={() => setOpen(!isOpen)} data-sfx="hotspot">
+                    <span className="cottage-resurrection-dot" />
+                    <span>
+                      <strong>Memory Link Re-established</strong>
+                      <small>完整信标已接入 · 点击{isOpen ? "收起" : "展开"}</small>
+                    </span>
+                    <ChevronDown size={15} />
+                  </button>
+                  <div className="cottage-resurrection-body" aria-hidden={!isOpen}>
+                    <CottageLogoMark className="cottage-resurrection-mark" />
+                    <MarkdownText text={message.text} />
+                  </div>
+                </article>
+              );
+            })() : (
             <article
               key={message.id}
               ref={(node) => {
                 messageRefs.current[message.id] = node;
               }}
-              className={`cottage-message-row ${message.role} ${
+              className={`cottage-message-row ${message.role} ${message.kind === "archive-preview" ? "is-archive-preview" : ""} ${
                 isSending && message.role === "companion" && message.id === visibleMessages[visibleMessages.length - 1]?.id
                   ? "is-streaming"
                   : ""
@@ -2539,6 +2694,7 @@ ${currentStateCard.content.trim()}`
                 </div>
               </div>
             </article>
+            )
           ))}
 
           {isSending && (
