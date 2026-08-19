@@ -45,8 +45,11 @@ interface MemoryGalleryStarlitGateProps {
 
 type GateShape = "GALAXY" | "MOBIUS" | "DNA" | "HEART" | "SPHERE";
 
-const GATE_IMAGE_SRC = "/cottage/visuals/memory-gallery-whale.png";
-const GATE_AUDIO_SRC = "/cottage/audio/KI-CO-001.mp3";
+const withBase = (path: string) =>
+  `${import.meta.env.BASE_URL}${path.replace(/^\/+/, "")}`;
+
+const GATE_IMAGE_SRC = withBase("cottage/visuals/memory-gallery-whale.png");
+const GATE_AUDIO_SRC = withBase("cottage/audio/KI-CO-001.mp3");
 const MOBILE_PARTICLE_COUNT = 6000;
 const DESKTOP_PARTICLE_COUNT = 9000;
 const GATE_CAMERA_FOV = 980;
