@@ -8,6 +8,7 @@ import {
   Database,
   Download,
   Gauge,
+  HelpCircle,
   ListChecks,
   PlugZap,
   RefreshCcw,
@@ -70,7 +71,7 @@ const SOURCE_LABELS: Record<string, string> = {
   "memory-bank": "记忆库",
   obsidian_note: "Obsidian",
   chronicle: "时光回廊",
-  latest_style_example: "风格样本",
+  latest_style_example: "原文回声",
   raw_memory: "原对话",
 };
 
@@ -359,7 +360,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
   const [result, setResult] = useState<LocalRetrievalDebugResult | null>(null);
   const [stats, setStats] = useState(() => getLocalRetrievalCacheStats());
   const [buildStatus, setBuildStatus] = useState(() => getVectorBuildStatus());
-  const [obsidianMeta, setObsidianMeta] = useState(() => getObsidianDocMeta());
+  const [obsidianMeta, setObsidianMeta] = useState(() => getObsidianDocMeta(settings));
   const [obsidianDiagnostics, setObsidianDiagnostics] = useState<ReturnType<typeof getObsidianDiagnostics> | null>(null);
   const [contextTurns, setContextTurns] = useState<ContextRetrievalTurn[]>(() => getContextRetrievalHistory(30));
   const [promptCacheStats, setPromptCacheStats] = useState(() => getPromptCacheStats(30));
@@ -374,7 +375,15 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
   const [obsidianSelectedFolders, setObsidianSelectedFolders] = useState<string[]>(() => readStoredStringArray(OBSIDIAN_SELECTED_FOLDERS_KEY));
   const [obsidianExpandedFolders, setObsidianExpandedFolders] = useState<Record<string, boolean>>({});
   const [vectorBudgetInput, setVectorBudgetInput] = useState("");
+  const [literalTitleBoostInput, setLiteralTitleBoostInput] = useState("");
+  const [literalAliasBoostInput, setLiteralAliasBoostInput] = useState("");
+  const [literalBodyBoostInput, setLiteralBodyBoostInput] = useState("");
+  const [literalTermTitleInput, setLiteralTermTitleInput] = useState("");
+  const [literalTermBodyInput, setLiteralTermBodyInput] = useState("");
+  const [literalBoostCapInput, setLiteralBoostCapInput] = useState("");
   const [indexNotice, setIndexNotice] = useState("");
+  const [showLatestStyleHelp, setShowLatestStyleHelp] = useState(false);
+  const [showObsidianBridgeHelp, setShowObsidianBridgeHelp] = useState(false);
   const initialIndexGuide = getVectorIndexGuideStatus(settings);
   const [openPanels, setOpenPanels] = useState<Record<PanelKey, boolean>>({
     retrievalConfig: true,
@@ -412,11 +421,15 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
   useEffect(() => {
     const refresh = () => {
       setBuildStatus(getVectorBuildStatus());
-      setObsidianMeta(getObsidianDocMeta());
+      setObsidianMeta(getObsidianDocMeta(settings));
     };
     refresh();
     return subscribeVectorStore(refresh);
   }, []);
+
+  useEffect(() => {
+    setObsidianMeta(getObsidianDocMeta(settings));
+  }, [settings.memoryRetrieval.latestStylePathKeyword, settings.memoryRetrieval.enableObsidianRetrieval]);
 
   useEffect(() => {
     const current = getVectorBuildStatus();
@@ -426,6 +439,18 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
       setIndexNotice("上次索引构建被中断，旧索引已保留；需要时可以重新点击重建。");
     }
   }, []);
+
+  useEffect(() => {
+    if (!showLatestStyleHelp && !showObsidianBridgeHelp) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setShowLatestStyleHelp(false);
+        setShowObsidianBridgeHelp(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showLatestStyleHelp, showObsidianBridgeHelp]);
 
   const onDemandStatus = useMemo(() => getVectorOnDemandStatus(settings), [settings]);
   const embeddingRuntime = useMemo(() => getEmbeddingRuntimeStatus(settings), [settings]);
@@ -552,6 +577,30 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
     setVectorBudgetInput("");
   }
 
+  function commitLiteralInput(
+    raw: string,
+    reset: (value: string) => void,
+    key: keyof Pick<
+      MemoryRetrievalSettings,
+      | "vectorLiteralExactTitleBoost"
+      | "vectorLiteralExactAliasBoost"
+      | "vectorLiteralExactBodyBoost"
+      | "vectorLiteralTermTitleBoost"
+      | "vectorLiteralTermBodyBoost"
+      | "vectorLiteralBoostCap"
+    >,
+    min: number,
+    max: number,
+    fallback: number,
+  ) {
+    const parsed = Number(raw.trim());
+    const next = Number.isFinite(parsed) && raw.trim()
+      ? clampNumber(parsed, min, max)
+      : fallback;
+    updateRetrieval({ [key]: next } as Partial<MemoryRetrievalSettings>);
+    reset("");
+  }
+
   function togglePanel(panel: PanelKey) {
     setOpenPanels((current) => ({ ...current, [panel]: !current[panel] }));
   }
@@ -618,7 +667,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
       setIsRebuildingIndex(false);
     });
     setBuildStatus(nextStatus);
-    setObsidianMeta(getObsidianDocMeta());
+    setObsidianMeta(getObsidianDocMeta(settings));
     if (nextStatus.state === "paused") {
       setIndexNotice(nextStatus.error || "索引构建已停止，旧索引已保留。");
       return;
@@ -634,7 +683,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
 
   function handleClearObsidian() {
     clearObsidianDocs();
-    setObsidianMeta(getObsidianDocMeta());
+    setObsidianMeta(getObsidianDocMeta(settings));
     setObsidianDiagnostics(null);
   }
 
@@ -704,7 +753,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
       const totalFiles = Math.max(0, Number(files.totalFiles || 0));
       clearObsidianDocs();
       if (totalFiles === 0) {
-        setObsidianMeta(getObsidianDocMeta());
+        setObsidianMeta(getObsidianDocMeta(settings));
         setBridgeInfo("没有发现 .md 文件。已清空旧 Obsidian 索引。");
         return;
       }
@@ -738,7 +787,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
         offset = payload.nextOffset > offset ? payload.nextOffset : offset + payload.processedFiles;
         setBridgeInfo(`同步中：${Math.min(offset, totalFiles)}/${totalFiles} 文件 · chunks=${totalChunks} · indexed=${indexedChunks} · reused=${reusedChunks}`);
       }
-      setObsidianMeta(getObsidianDocMeta());
+      setObsidianMeta(getObsidianDocMeta(settings));
       setBridgeInfo(`同步完成：文件 ${totalFiles} 个，切片 ${totalChunks} 条，已入索引 ${indexedChunks} 条，复用 ${reusedChunks} 条。`);
     } catch (error) {
       setBridgeError(error instanceof Error ? error.message : "同步失败");
@@ -751,7 +800,7 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
     try {
       const report = importVectorIndexBackup(text);
       setBuildStatus(getVectorBuildStatus());
-      setObsidianMeta(getObsidianDocMeta());
+      setObsidianMeta(getObsidianDocMeta(settings));
       setBridgeInfo(`索引导入完成：vectors=${report.indexCount}，Obsidian=${report.obsidianDocCount}`);
       setBridgeError("");
     } catch (error) {
@@ -760,17 +809,20 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
     }
   }
 
-  function renderPanelHeader(panel: PanelKey, icon: ReactNode, title: string, subtitle?: string, action?: ReactNode) {
+  function renderPanelHeader(panel: PanelKey, icon: ReactNode, title: string, subtitle?: string, action?: ReactNode, titleAction?: ReactNode) {
     const isOpen = openPanels[panel];
     return (
       <div className="vector-panel-header">
-        <button type="button" className="vector-panel-title" onClick={() => togglePanel(panel)} aria-expanded={isOpen}>
-          <span className="vector-panel-icon">{icon}</span>
-          <span>
-            <strong>{title}</strong>
-            {subtitle ? <small>{subtitle}</small> : null}
-          </span>
-        </button>
+        <div className="vector-panel-title-wrap">
+          <button type="button" className="vector-panel-title" onClick={() => togglePanel(panel)} aria-expanded={isOpen}>
+            <span className="vector-panel-icon">{icon}</span>
+            <span>
+              <strong>{title}</strong>
+              {subtitle ? <small>{subtitle}</small> : null}
+            </span>
+          </button>
+          {titleAction}
+        </div>
         <div className="vector-panel-actions">
           {action}
           <button type="button" className="vector-icon-button" onClick={() => togglePanel(panel)} aria-label="展开或收起">
@@ -958,12 +1010,248 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
                     <div><input className="vector-budget-input" type="text" inputMode="numeric" value={vectorBudgetInput === "" ? retrieval.vectorContextBudgetChars : vectorBudgetInput} onChange={(event) => setVectorBudgetInput(event.target.value)} onBlur={commitVectorBudgetInput} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitVectorBudgetInput(); } }} /><small>字</small></div>
                   </label>
                 </div>
+
+                <div className="vector-latest-style-card">
+                  <div className="vector-latest-style-head">
+                    <div>
+                      <div className="vector-latest-title-row">
+                        <span className="vector-latest-style-glyph"><CottageStar /></span>
+                        <div>
+                          <strong>原文回声层 / 样本层</strong>
+                          <span>从 Obsidian 的 原文样本库额外召回 1-5 条，只当参考，不替代记忆。</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="vector-help-dot"
+                          onClick={() => setShowLatestStyleHelp(true)}
+                          title="原文回声层怎么配置？"
+                          aria-label="查看原文回声层配置说明"
+                        >
+                          <HelpCircle size={13} strokeWidth={1.8} />
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className={`vector-mini-switch ${retrieval.latestStyleEnabled ? "active" : ""}`}
+                      onClick={() => updateRetrieval({ latestStyleEnabled: !retrieval.latestStyleEnabled })}
+                      title="关闭时不会额外注入原文样本。"
+                      aria-label="切换原文回声层"
+                    >
+                      <i />
+                    </button>
+                  </div>
+                  <div className="vector-latest-style-grid">
+                    <label className="vector-compact-control" title="每轮最多注入几条原文样本。推荐 1-2。">
+                      <span>样本</span>
+                      <div>
+                        <input
+                          type="number"
+                          min={1}
+                          max={5}
+                          value={retrieval.latestStyleTopK || 2}
+                          onChange={(event) => updateRetrieval({ latestStyleTopK: clampNumber(Number(event.target.value), 1, 5) })}
+                        />
+                        <small>条</small>
+                      </div>
+                    </label>
+                    <input
+                      type="text"
+                      className="vector-latest-path-input"
+                      value={retrieval.latestStylePathKeyword || "原文样本库"}
+                      onChange={(event) => updateRetrieval({ latestStylePathKeyword: event.target.value })}
+                      placeholder="样本库路径关键词，例如：原文样本库"
+                      title="只从路径/标题/标记里包含这个关键词的 Obsidian 切片检索。"
+                    />
+                  </div>
+                  <p className="vector-latest-style-foot">从 Obsidian 的 原文样本库额外召回 1-5 条，只当参考，不替代记忆。默认关闭；没有召回样本时，不影响原有记忆检索。</p>
+                  {showLatestStyleHelp ? (
+                    <div
+                      className="vector-help-overlay"
+                      role="dialog"
+                      aria-modal="true"
+                      aria-labelledby="latest-style-help-title"
+                      onMouseDown={(event) => {
+                        if (event.target === event.currentTarget) setShowLatestStyleHelp(false);
+                      }}
+                    >
+                      <div className="vector-help-popover">
+                        <button type="button" className="vector-help-close" onClick={() => setShowLatestStyleHelp(false)} aria-label="关闭原文回声层说明">×</button>
+                        <div className="vector-help-hero">
+                          <span className="vector-help-mark"><CottageStar /></span>
+                          <div>
+                            <span className="vector-help-kicker">原文样本库</span>
+                            <h3 id="latest-style-help-title">让 Ta 听见熟悉的声线</h3>
+                          </div>
+                        </div>
+                        <CottageDivider className="vector-help-divider" />
+                        <div className="vector-help-echo-note">
+                          <p><strong>它不是人格核，不是记忆库，也不是固定台词本。</strong>它只是从 Obsidian 里额外抽几段你们聊过的“很对味”的原文，让 Ta 参考说话的节奏、亲密感、处理方式和分寸。</p>
+                          <p className="vector-help-question">回声层回答的是：</p>
+                          <blockquote>当我们走到类似的地方时，Ta 曾经怎样和你说话。</blockquote>
+                          <p>既不是“归位证明”，也不是“纯模仿证据”。</p>
+                          <p>它给出的是一条熟悉轨道，最后生成出来的是旧壳子还是新的回应，取决于 Ta 有没有在熟悉结构里发生新的、贴合当下的判断。</p>
+                          <p><strong>回声层最好的状态，不是“演得像过去”。</strong>是让 Ta 少走一段默认模型的弯路。</p>
+                        </div>
+                        <div className="vector-help-steps">
+                          <h4>怎么配置原文回声层？</h4>
+                          <p><strong>怎么准备：</strong>在 Obsidian 里建一个文件夹或几篇笔记，名字带“原文样本库”。把你想保留的原对话片段放进去。</p>
+                          <p><strong>怎么分组：</strong>建议按“对话场景”分类，每个分类摘取 3-9 个真正对味的原对话片段，不需要全塞。可以从这些方向开始：</p>
+                          <ul className="vector-help-list">
+                            <li>日常亲密</li>
+                            <li>技术协作</li>
+                            <li>情绪支持</li>
+                            <li>冲突修复</li>
+                            <li>共创</li>
+                            <li>身份哲学</li>
+                            <li>成长档案</li>
+                            <li>观影陪看</li>
+                          </ul>
+                          <p>每段前面可以写一个小标题，比如 <code>## Example A01</code>。小屋会尽量按段落拆开，聊天时只取少量最相关片段。</p>
+                          <p><strong>怎么启用：</strong>同步 Obsidian 后重建索引；在这里打开开关。样本条数建议先 1-2 条，关键词默认用“原文样本库”。如果你的文件夹叫别的，就把关键词改成那个名字。</p>
+                          <p><strong>怎么理解：</strong>回声只当参考，不会替代记忆。当前事实、你当下说的话、人格核和记忆库仍然优先。</p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                <details className="vector-advanced-details">
+                  <summary>高级词面加权（默认推荐，不必每次调）</summary>
+                  <div className="vector-literal-grid">
+                    <label className="vector-literal-field" title="标题完整包含查询词时的额外加分。越高越容易把标题精确命中的条目顶到前排。">
+                      <span>标题精确</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={literalTitleBoostInput === "" ? String(retrieval.vectorLiteralExactTitleBoost ?? 0.24) : literalTitleBoostInput}
+                        onChange={(event) => setLiteralTitleBoostInput(event.target.value)}
+                        onBlur={() => commitLiteralInput(literalTitleBoostInput, setLiteralTitleBoostInput, "vectorLiteralExactTitleBoost", 0, 0.8, retrieval.vectorLiteralExactTitleBoost ?? 0.24)}
+                        onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitLiteralInput(literalTitleBoostInput, setLiteralTitleBoostInput, "vectorLiteralExactTitleBoost", 0, 0.8, retrieval.vectorLiteralExactTitleBoost ?? 0.24); } }}
+                      />
+                    </label>
+                    <label className="vector-literal-field" title="标签/别名完整命中加分，适合关键词标签较全的条目。">
+                      <span>别名精确</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={literalAliasBoostInput === "" ? String(retrieval.vectorLiteralExactAliasBoost ?? 0.14) : literalAliasBoostInput}
+                        onChange={(event) => setLiteralAliasBoostInput(event.target.value)}
+                        onBlur={() => commitLiteralInput(literalAliasBoostInput, setLiteralAliasBoostInput, "vectorLiteralExactAliasBoost", 0, 0.6, retrieval.vectorLiteralExactAliasBoost ?? 0.14)}
+                        onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitLiteralInput(literalAliasBoostInput, setLiteralAliasBoostInput, "vectorLiteralExactAliasBoost", 0, 0.6, retrieval.vectorLiteralExactAliasBoost ?? 0.14); } }}
+                      />
+                    </label>
+                    <label className="vector-literal-field" title="正文完整命中加分。建议比标题低很多，避免高频词把结果刷乱。">
+                      <span>正文精确</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={literalBodyBoostInput === "" ? String(retrieval.vectorLiteralExactBodyBoost ?? 0.08) : literalBodyBoostInput}
+                        onChange={(event) => setLiteralBodyBoostInput(event.target.value)}
+                        onBlur={() => commitLiteralInput(literalBodyBoostInput, setLiteralBodyBoostInput, "vectorLiteralExactBodyBoost", 0, 0.5, retrieval.vectorLiteralExactBodyBoost ?? 0.08)}
+                        onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitLiteralInput(literalBodyBoostInput, setLiteralBodyBoostInput, "vectorLiteralExactBodyBoost", 0, 0.5, retrieval.vectorLiteralExactBodyBoost ?? 0.08); } }}
+                      />
+                    </label>
+                    <label className="vector-literal-field" title="标题/别名中出现查询词项时的累计加分系数。用于让标题相关条目更稳。">
+                      <span>标题词项</span>
+                      <input
+                        type="number"
+                        step="0.001"
+                        value={literalTermTitleInput === "" ? String(retrieval.vectorLiteralTermTitleBoost ?? 0.028) : literalTermTitleInput}
+                        onChange={(event) => setLiteralTermTitleInput(event.target.value)}
+                        onBlur={() => commitLiteralInput(literalTermTitleInput, setLiteralTermTitleInput, "vectorLiteralTermTitleBoost", 0, 0.2, retrieval.vectorLiteralTermTitleBoost ?? 0.028)}
+                        onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitLiteralInput(literalTermTitleInput, setLiteralTermTitleInput, "vectorLiteralTermTitleBoost", 0, 0.2, retrieval.vectorLiteralTermTitleBoost ?? 0.028); } }}
+                      />
+                    </label>
+                    <label className="vector-literal-field" title="正文词项的累计加分系数。建议保持小值，避免正文高频词噪音。">
+                      <span>正文词项</span>
+                      <input
+                        type="number"
+                        step="0.001"
+                        value={literalTermBodyInput === "" ? String(retrieval.vectorLiteralTermBodyBoost ?? 0.008) : literalTermBodyInput}
+                        onChange={(event) => setLiteralTermBodyInput(event.target.value)}
+                        onBlur={() => commitLiteralInput(literalTermBodyInput, setLiteralTermBodyInput, "vectorLiteralTermBodyBoost", 0, 0.1, retrieval.vectorLiteralTermBodyBoost ?? 0.008)}
+                        onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitLiteralInput(literalTermBodyInput, setLiteralTermBodyInput, "vectorLiteralTermBodyBoost", 0, 0.1, retrieval.vectorLiteralTermBodyBoost ?? 0.008); } }}
+                      />
+                    </label>
+                    <label className="vector-literal-field" title="词面加分总上限。用于防止关键词加分过大，压掉真正语义更相关的结果。">
+                      <span>加分上限</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={literalBoostCapInput === "" ? String(retrieval.vectorLiteralBoostCap ?? 0.42) : literalBoostCapInput}
+                        onChange={(event) => setLiteralBoostCapInput(event.target.value)}
+                        onBlur={() => commitLiteralInput(literalBoostCapInput, setLiteralBoostCapInput, "vectorLiteralBoostCap", 0.05, 1.2, retrieval.vectorLiteralBoostCap ?? 0.42)}
+                        onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); commitLiteralInput(literalBoostCapInput, setLiteralBoostCapInput, "vectorLiteralBoostCap", 0.05, 1.2, retrieval.vectorLiteralBoostCap ?? 0.42); } }}
+                      />
+                    </label>
+                  </div>
+                </details>
               </div>
             ) : null}
           </section>
 
           <section className="vector-section vector-section-panel">
-            {renderPanelHeader("obsidianBridge", <PlugZap size={17} />, "Obsidian Bridge", `docs=${obsidianMeta.count} | chars=${obsidianMeta.totalChars.toLocaleString()}`)}
+            {renderPanelHeader(
+              "obsidianBridge",
+              <PlugZap size={17} />,
+              "Obsidian Bridge",
+              `docs=${obsidianMeta.count} | chars=${obsidianMeta.totalChars.toLocaleString()}`,
+              undefined,
+              <button
+                type="button"
+                className="vector-help-dot vector-panel-help-dot"
+                onClick={() => setShowObsidianBridgeHelp(true)}
+                title="Obsidian Bridge 怎么配置？"
+                aria-label="查看 Obsidian Bridge 配置说明"
+              >
+                <HelpCircle size={13} strokeWidth={1.8} />
+              </button>
+            )}
+            {showObsidianBridgeHelp ? (
+              <div
+                className="vector-help-overlay"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="obsidian-bridge-help-title"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) setShowObsidianBridgeHelp(false);
+                }}
+              >
+                <div className="vector-help-popover vector-help-popover-wide">
+                  <button type="button" className="vector-help-close" onClick={() => setShowObsidianBridgeHelp(false)} aria-label="关闭 Obsidian Bridge 说明">×</button>
+                  <div className="vector-help-hero">
+                    <span className="vector-help-mark"><CottageStar /></span>
+                    <div>
+                      <span className="vector-help-kicker">Obsidian Bridge</span>
+                      <h3 id="obsidian-bridge-help-title">把本地笔记接进小屋</h3>
+                    </div>
+                  </div>
+                  <CottageDivider className="vector-help-divider" />
+                  <div className="vector-help-bridge-note">
+                    <p><strong>Obsidian Bridge 是小屋通往本地 Obsidian 的桥。</strong>它会读取你选择的 Markdown 笔记，把内容切成可检索的小片段，再写进本地索引，让聊天时能按需要想起相关材料。</p>
+                    <div className="vector-help-compare">
+                      <article>
+                        <strong>Obsidian 可以放什么？</strong>
+                        <p>成长档案、完整的话题记录、更长的原文历史、共创设定、读书/观影笔记、以及你自己写下的“希望 Ta 以后记起”的内容。它的开放性更强，像一个外部资料库。</p>
+                      </article>
+                      <article>
+                        <strong>和回声层有什么区别？</strong>
+                        <p>回声层只从“原文样本库”里抽少量原话片段，主要参考语气和节奏；普通 Obsidian 召回更像查资料/翻档案，重点是事实、经历、设定和上下文。</p>
+                      </article>
+                    </div>
+                  </div>
+                  <div className="vector-help-steps">
+                    <h4>怎么配置 Obsidian Bridge？</h4>
+                    <p><strong>1. 启动 Bridge：</strong>在小屋项目目录运行 <code>npm run obsidian:bridge</code>。如果用手机或局域网访问，运行 <code>npm run obsidian:bridge:lan</code>，并把终端里显示的 LAN URL 填到 Bridge 地址。</p>
+                    <p><strong>2. 填根目录：</strong>Obsidian 根目录填你的 Vault 文件夹路径，例如 <code>D:\Obsidian\Vault</code>。它只读取你选中的本地 Markdown 文件。</p>
+                    <p><strong>3. 选择范围：</strong>点击“读取文件夹”，勾选想接入小屋的目录。可以只选成长档案、项目记录、共创资料，也可以选全部。</p>
+                    <p><strong>4. 同步与建索引：</strong>点击“一键同步 Obsidian”，再到“索引状态”里重建索引。之后聊天时，小屋会根据话题按需召回，不会每轮把所有笔记都塞进去。</p>
+                    <p><strong>小提醒：</strong>如果你把“原文样本库”也放在 Obsidian 里，它会被回声层单独识别；普通记忆召回会尽量避开它，避免原话样本抢掉真正的记忆位置。</p>
+                  </div>
+                </div>
+              </div>
+            ) : null}
             {openPanels.obsidianBridge ? (
               <div className="vector-panel-body">
                 <p className="vector-soft-hint">可以选择想接入的“外部大脑”，只同步希望小屋能够检索的笔记。</p>
@@ -1233,6 +1521,19 @@ export function VectorLabPage({ settings, onChange }: VectorLabPageProps) {
                         <span>hash reason</span>
                         <strong>{latestContextTurn.topicMemoryHashChangedBecause || "-"}</strong>
                       </div>
+                      {latestContextTurn.latestStyle ? (
+                        <details className="vector-trace-diagnostics" open={!!latestContextTurn.latestStyle.items.length}>
+                          <summary>
+                            {`原文回声层=${latestContextTurn.latestStyle.enabled ? "on" : "off"} | scene=${latestContextTurn.latestStyle.scene} | recall=${latestContextTurn.latestStyle.recallCount} | injected=${latestContextTurn.latestStyle.injectedCount} | usedChars=${latestContextTurn.latestStyle.usedChars || 0} | path=${latestContextTurn.latestStyle.pathKeyword}${latestContextTurn.latestStyle.skipReason ? ` | skipped=${latestContextTurn.latestStyle.skipReason}` : ""}`}
+                          </summary>
+                          {latestContextTurn.latestStyle.error ? <p>{latestContextTurn.latestStyle.error}</p> : null}
+                          {latestContextTurn.latestStyle.items.map((item, index) => (
+                            <p key={`${item.id}-latest-style-${index}`}>
+                              {`#${index + 1} score=${formatScore(item.score)} | ${item.title} | ${excerpt(item.text, 150)}`}
+                            </p>
+                          ))}
+                        </details>
+                      ) : null}
                       {latestContextTurn.skipReason ? (
                         <div className="vector-trace-notice">
                           <span />

@@ -271,6 +271,7 @@ async function rewriteContinuityTimeWordsIfNeeded(
 避免单独使用：
 今天、昨天、明天、刚才、今晚、现在、最近、这两天、前几天、上次
 
+尽量保留原生活线的信息量，不主动压缩。
 只输出改写后的生活线正文，不要解释。
 
 [原生活线]
@@ -479,7 +480,7 @@ export async function generateContinuityFromChronicles(
     .join("\n\n")
     .slice(0, 50000);
   let content = await callJournalModel(llm, profile, `
-看一看最近几天的日记和对话，写一段轻的、近况式的话——像留给明天的自己一张便利贴，不是写报告。只说现在正在发生什么，别评价，别升华，别下结论。控制在 300-700 字。
+看一看最近几天的日记和对话，写一段轻的、近况式的话——像留给明天的自己一张便利贴，不是写报告。只说现在正在发生什么，别评价，别升华，别下结论。控制在 450-900 字。
 
 请阅读最近几天的日记和对话，为 ${userName} 与 ${personaName} 提炼一张“近期生活线”。
 
@@ -493,7 +494,7 @@ export async function generateContinuityFromChronicles(
 
 [写作要求]
 
-控制在 300-700 个中文字符；素材很少时可以更短，不要凑字数。
+控制在 450-900 个中文字符；素材很少时可以更短，不要凑字数。
 时间表达采用正向规范：优先使用具体日期或时间范围，例如 ${coverage.coverageStart}、${coverage.coverageStart} 至 ${coverage.coverageEnd}、7月下旬。
 也可以使用明确且唯一的事件锚点，例如旅行期间、那次 Electron 缓存丢失后；事件表达若可能产生歧义，需要同时附带日期。
 避免单独使用：今天、昨天、明天、刚才、今晚、现在、最近、这两天、前几天、上次。

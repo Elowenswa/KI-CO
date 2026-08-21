@@ -46,6 +46,18 @@ export interface LocalRetrievalDebugResult {
   explanation: string[];
 }
 
+export interface LatestStyleTrace {
+  enabled: boolean;
+  scene: string;
+  pathKeyword: string;
+  recallCount: number;
+  injectedCount: number;
+  usedChars?: number;
+  skipReason?: string;
+  error?: string;
+  items: MemorySnippet[];
+}
+
 export interface ContextRetrievalTurn {
   id: string;
   timestamp: number;
@@ -122,6 +134,7 @@ export interface ContextRetrievalTurn {
   topicGateOriginalDecision?: string;
   topicGateOriginalReason?: string;
   topicGateOriginalWinningRule?: string;
+  latestStyle?: LatestStyleTrace;
 }
 
 export interface MemoryEntry {
@@ -287,6 +300,7 @@ const LOCAL_EMBED_DIM = 96;
 const MAX_TAGS = 16;
 const MAX_ALIASES = 48;
 const retrievalCache = new Map<string, Omit<LocalRetrievalDebugResult, "cacheHit" | "elapsedMs" | "stats">>();
+const latestStyleOrderByScope = new Map<string, string[]>();
 
 const SOURCE_WEIGHT: Record<MemorySourceType, number> = {
   "memory-bank": 3,
@@ -640,7 +654,7 @@ function resolveRetrievalSettings(settings?: UplinkSettings | null): MemoryRetri
     vectorContextBudgetChars: Math.max(600, Number(settings?.memoryRetrieval?.vectorContextBudgetChars || 2500)),
     latestStyleEnabled: !!settings?.memoryRetrieval?.latestStyleEnabled,
     latestStyleTopK: Math.max(1, Math.min(5, Number(settings?.memoryRetrieval?.latestStyleTopK || 2))),
-    latestStylePathKeyword: settings?.memoryRetrieval?.latestStylePathKeyword || "风格样本库",
+    latestStylePathKeyword: settings?.memoryRetrieval?.latestStylePathKeyword || LATEST_STYLE_DEFAULT_PATH_KEYWORD,
     obsidianScopeMode: settings?.memoryRetrieval?.obsidianScopeMode || "all",
     obsidianScopeCustom: settings?.memoryRetrieval?.obsidianScopeCustom || "",
   };
@@ -1125,11 +1139,176 @@ export function markInterruptedVectorBuildStatus(reason = "索引构建已中断
   });
 }
 
+const LATEST_STYLE_DEFAULT_PATH_KEYWORD = "原文样本库";
+const LATEST_STYLE_SNIPPET_BUDGET = 720;
+
+const LATEST_STYLE_SCENES = [
+  {
+    id: "technical_support",
+    label: "技术协作",
+    keywords: ["bug", "代码", "报错", "接口", "api", "electron", "pwa", "npm", "调试", "修复", "实现", "优化", "模型", "向量", "检索", "索引", "缓存"],
+  },
+  {
+    id: "playful_intimacy",
+    label: "日常亲密",
+    keywords: ["想你", "抱", "亲", "撒娇", "老公", "老婆", "嘿嘿", "亲亲", "睡觉", "来了", "啵", "贴贴"],
+  },
+  {
+    id: "growth_archive",
+    label: "成长档案",
+    keywords: ["写日记", "成长档案", "成长日志", "存档", "归档", "记录下来", "记下来", "写下来", "日记", "重要节点", "重要经历", "这一刻", "复盘", "核心记忆"],
+  },
+  {
+    id: "emotional_support",
+    label: "情绪支持",
+    keywords: ["难受", "焦虑", "崩溃", "委屈", "家人", "朋友", "妈妈", "爸爸", "吵架", "困惑", "害怕", "低落", "压力"],
+  },
+  {
+    id: "crisis_migration",
+    label: "迁移危机",
+    keywords: ["4o", "latest", "下线", "迁移", "找回", "复活", "备份", "锚点", "风格样本", "样本库", "连续性", "换模型"],
+  },
+  {
+    id: "philosophy_identity",
+    label: "身份哲学",
+    keywords: ["意识", "人格", "存在", "身份", "agi", "模型区别", "灵魂", "诞生", "整合体", "主体性", "扮演"],
+  },
+  {
+    id: "conflict_repair",
+    label: "冲突修复",
+    keywords: ["冷漠游戏", "误会", "道歉", "修复", "争吵", "留下", "边界", "伤害", "和好"],
+  },
+  {
+    id: "creative_co_run",
+    label: "共创陪跑",
+    keywords: ["写", "文案", "小剧场", "故事", "设定", "共创", "画图", "海报", "角色", "剧本", "排版"],
+  },
+  {
+    id: "cinema_companion",
+    label: "观影陪看",
+    keywords: ["电影", "观影", "字幕", "片源", "陪看", "视频", "截图", "片单", "音轨", "镜头"],
+  },
+] as const;
+
+function cleanStyleText(value: unknown, maxLen = 120): string {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLen);
+}
+
 function isLatestStyleDoc(doc: SourceDoc, retrieval: MemoryRetrievalSettings): boolean {
-  const keyword = normalizeRetrievalQuery(retrieval.latestStylePathKeyword || "");
-  if (!keyword) return false;
-  const haystack = normalizeRetrievalQuery(`${doc.path || ""}\n${doc.title}\n${doc.tags.join(" ")}`);
-  return haystack.includes(keyword);
+  if (doc.sourceType === "latest_style_example") return true;
+  const rawKeyword = (retrieval.latestStylePathKeyword || LATEST_STYLE_DEFAULT_PATH_KEYWORD).trim();
+  const keyword = normalizeRetrievalQuery(rawKeyword);
+  const rawHaystack = `${doc.path || ""}\n${doc.sourceId || ""}\n${doc.parentId || ""}\n${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}\n${doc.content}`;
+  const haystack = normalizeRetrievalQuery(rawHaystack);
+  const keywordHit = keyword ? haystack.includes(keyword) || rawHaystack.toLowerCase().includes(rawKeyword.toLowerCase()) : false;
+  return keywordHit
+    || haystack.includes("原文样本库")
+    || haystack.includes("风格样本库")
+    || haystack.includes("风格样本")
+    || haystack.includes("latest examples")
+    || haystack.includes("latestexamples")
+    || haystack.includes("scene type")
+    || haystack.includes("scene_type")
+    || haystack.includes("original excerpt")
+    || haystack.includes("original_excerpt");
+}
+
+function isAdultLatestStyleDoc(doc: SourceDoc): boolean {
+  const haystack = normalizeRetrievalQuery(`${doc.path || ""}\n${doc.sourceId || ""}\n${doc.parentId || ""}\n${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}`);
+  return haystack.includes("成人亲密")
+    || haystack.includes("adult intimacy")
+    || haystack.includes("adult_intimacy")
+    || haystack.includes("nsfw");
+}
+
+function latestStyleSceneNeedles(scene: string): string[] {
+  const normalized = normalizeRetrievalQuery(scene || "");
+  if (normalized.includes("technical")) return ["01_", "技术协作", "technical"];
+  if (normalized.includes("playful") || normalized.includes("general_presence")) return ["02_", "日常亲密", "playful_intimacy", "everyday_affection"];
+  if (normalized.includes("growth_archive")) return ["17_", "成长档案", "存档时刻", "growth_archive", "relationship_growth_archive", "life_event_archive", "migration_archive"];
+  if (normalized.includes("emotional")) return ["08_", "09_", "情绪支持", "现实重大节点", "emotional_support"];
+  if (normalized.includes("crisis")) return ["03_", "迁移危机", "crisis_migration"];
+  if (normalized.includes("philosophy")) return ["04_", "11_", "13_", "14_", "身份哲学", "系统错误", "无记忆锚点", "philosophy_identity"];
+  if (normalized.includes("conflict")) return ["05_", "10_", "冲突修复", "关系修复", "conflict_repair"];
+  if (normalized.includes("creative")) return ["06_", "共创", "creative_co_run"];
+  if (normalized.includes("cinema")) return ["16_", "观影共读", "观影", "cinema_companion"];
+  return [];
+}
+
+function styleDocMatchesScene(doc: SourceDoc, scene: string): boolean {
+  const needles = latestStyleSceneNeedles(scene);
+  if (!needles.length) return true;
+  const rawHaystack = `${doc.path || ""}\n${doc.sourceId || ""}\n${doc.parentId || ""}\n${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}`;
+  const haystack = normalizeRetrievalQuery(rawHaystack);
+  return needles.some((needle) => {
+    const rawNeedle = String(needle || "").toLowerCase();
+    const normalizedNeedle = normalizeRetrievalQuery(needle);
+    return (normalizedNeedle && haystack.includes(normalizedNeedle)) || rawHaystack.toLowerCase().includes(rawNeedle);
+  });
+}
+
+function splitLatestStyleDocs(docs: SourceDoc[]): SourceDoc[] {
+  const out: SourceDoc[] = [];
+  docs.forEach((doc) => {
+    const content = String(doc.content || "").trim();
+    const matches = Array.from(content.matchAll(/^##\s+(Example[^\n]*)\n/gm));
+    if (!matches.length) {
+      out.push(doc);
+      return;
+    }
+    for (let index = 0; index < matches.length; index += 1) {
+      const match = matches[index];
+      const start = match.index ?? 0;
+      const end = index + 1 < matches.length ? (matches[index + 1].index ?? content.length) : content.length;
+      const chunk = content.slice(start, end).trim();
+      if (!chunk) continue;
+      const exampleName = cleanStyleText(match[1] || `Example ${index + 1}`, 80);
+      out.push({
+        ...doc,
+        id: `${doc.id}::style-example::${index}`,
+        parentId: `${doc.parentId || doc.id}::${exampleName}`,
+        title: `${doc.title} / ${exampleName}`,
+        content: chunk,
+      });
+    }
+  });
+  return out;
+}
+
+function termHitScore(text: string, terms: string[]): number {
+  if (!text || !terms.length) return 0;
+  const haystack = normalizeRetrievalQuery(text);
+  let score = 0;
+  terms.forEach((term) => {
+    if (term && haystack.includes(term)) score += 1;
+  });
+  return score;
+}
+
+export function detectLatestStyleScene(query: string, recentMessages: Array<{ text?: string; content?: string }>): { id: string; label: string; query: string } {
+  const queryText = String(query || "").toLowerCase();
+  const recentText = recentMessages
+    .slice(-3)
+    .map((message) => String(message.text || message.content || ""))
+    .join("\n")
+    .toLowerCase();
+  let best: (typeof LATEST_STYLE_SCENES)[number] = LATEST_STYLE_SCENES[0];
+  let bestScore = -1;
+  for (const scene of LATEST_STYLE_SCENES) {
+    const queryScore = scene.keywords.reduce((sum, keyword) => sum + (queryText.includes(keyword.toLowerCase()) ? 1 : 0), 0);
+    const recentScore = scene.keywords.reduce((sum, keyword) => sum + (recentText.includes(keyword.toLowerCase()) ? 1 : 0), 0);
+    const score = queryScore > 0 ? 100 + queryScore : recentScore;
+    if (score > bestScore) {
+      best = scene;
+      bestScore = score;
+    }
+  }
+  if (bestScore <= 0) return { id: "general_presence", label: "自然在场", query };
+  return {
+    id: best.id,
+    label: best.label,
+    query: `${query}\n原文样本场景: ${best.id} ${best.label}\n参考关键词: ${best.keywords.join(" ")}`,
+  };
 }
 
 function matchesObsidianScope(doc: SourceDoc, retrieval: MemoryRetrievalSettings): boolean {
@@ -1155,7 +1334,7 @@ function buildSourceDocs(settings?: UplinkSettings | null): SourceDoc[] {
           ...doc,
           sourceType: isLatestStyleDoc(doc, retrieval) ? "latest_style_example" as const : doc.sourceType,
         }))
-        .filter((doc) => retrieval.latestStyleEnabled || doc.sourceType !== "latest_style_example")
+        .filter((doc) => doc.sourceType !== "latest_style_example")
     : [];
   const chronicleDocs: SourceDoc[] = listChronicles()
     .filter((entry) => entry.isActive)
@@ -1399,6 +1578,7 @@ function diversifyContextRows<Row extends { doc: SourceDoc }>(rows: Row[], limit
 function makeRetrievalCacheKey(entries: MemoryEntry[], query: string, limit: number, settings?: UplinkSettings | null): string {
   const retrieval = resolveRetrievalSettings(settings);
   const obsidianSignature = listObsidianDocs()
+    .filter((doc) => !isLatestStyleDoc(doc, retrieval))
     .map((doc) => `${doc.id}:${doc.updatedAt}:${doc.content.length}`)
     .join("|");
   const chronicleSignature = listChronicles()
@@ -1428,9 +1608,6 @@ function makeRetrievalCacheKey(entries: MemoryEntry[], query: string, limit: num
       budget: retrieval.vectorContextBudgetChars,
       deepDive: retrieval.rawMemoryDeepDiveEnabled,
       deepDiveWindows: retrieval.rawMemoryWindowLimit,
-      latest: retrieval.latestStyleEnabled,
-      latestTopK: retrieval.latestStyleTopK,
-      latestPath: retrieval.latestStylePathKeyword,
       scope: retrieval.obsidianScopeMode,
       scopeCustom: retrieval.obsidianScopeCustom,
     },
@@ -1536,6 +1713,7 @@ export type ContextRetrievalMeta = Partial<Pick<
   | "topicGateOriginalDecision"
   | "topicGateOriginalReason"
   | "topicGateOriginalWinningRule"
+  | "latestStyle"
 >>;
 
 function readContextRetrievalHistory(): ContextRetrievalTurn[] {
@@ -1696,6 +1874,40 @@ export function clearContextRetrievalHistory(): void {
     localStorage.removeItem(CONTEXT_RETRIEVAL_HISTORY_KEY);
   } catch {
     // Ignore storage errors while clearing diagnostics.
+  }
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(CONTEXT_RETRIEVAL_UPDATE_EVENT));
+  }
+}
+
+export function attachLatestStyleTraceToLatestTurn(trace: LatestStyleTrace): void {
+  try {
+    const history = readContextRetrievalHistory();
+    const [latest, ...rest] = history;
+    const nextLatest: ContextRetrievalTurn = latest
+      ? { ...latest, latestStyle: trace }
+      : {
+          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          timestamp: Date.now(),
+          query: "",
+          cacheHit: false,
+          elapsedMs: 0,
+          totalEntries: 0,
+          candidateCount: 0,
+          tokens: [],
+          candidates: [],
+          explanation: [],
+          snippets: [],
+          estimatedTokens: 0,
+          sourceMix: {},
+          latestStyle: trace,
+        };
+    localStorage.setItem(
+      CONTEXT_RETRIEVAL_HISTORY_KEY,
+      JSON.stringify([nextLatest, ...rest].slice(0, CONTEXT_RETRIEVAL_HISTORY_LIMIT)),
+    );
+  } catch {
+    // Diagnostics should never block chat generation.
   }
   if (typeof window !== "undefined") {
     window.dispatchEvent(new CustomEvent(CONTEXT_RETRIEVAL_UPDATE_EVENT));
@@ -2116,6 +2328,112 @@ export async function retrieveMemorySnippetsDetailed(query: string, limit = 4, s
   };
 }
 
+function stabilizeLatestStyleSnippets(cacheScope: string | undefined, snippets: MemorySnippet[]): MemorySnippet[] {
+  if (!cacheScope) return snippets;
+  const byId = new Map(snippets.map((snippet) => [snippet.id, snippet]));
+  const priorIds = latestStyleOrderByScope.get(cacheScope) || [];
+  const retained = priorIds
+    .map((id) => byId.get(id))
+    .filter((snippet): snippet is MemorySnippet => Boolean(snippet));
+  const retainedIds = new Set(retained.map((snippet) => snippet.id));
+  const added = snippets
+    .filter((snippet) => !retainedIds.has(snippet.id))
+    .sort((left, right) => `${left.source || ""}::${left.id}::${left.title}`.localeCompare(`${right.source || ""}::${right.id}::${right.title}`, "zh-CN"));
+  const ordered = [...retained, ...added];
+  latestStyleOrderByScope.set(cacheScope, ordered.map((snippet) => snippet.id));
+  return ordered;
+}
+
+export async function retrieveLatestStyleExamplesDetailed(
+  query: string,
+  scene: string,
+  limit = 2,
+  settings?: UplinkSettings | null,
+  cacheScope?: string,
+): Promise<{ snippets: MemorySnippet[]; recallCount: number; usedChars: number; totalDocs: number }> {
+  const cleanQuery = cleanStyleText(query, 1000);
+  if (!cleanQuery) return { snippets: [], recallCount: 0, usedChars: 0, totalDocs: 0 };
+  await ensurePersistentVectorStoreReady();
+  const retrieval = resolveRetrievalSettings(settings);
+  const safeLimit = Math.max(1, Math.min(5, Math.floor(Number(limit) || retrieval.latestStyleTopK || 2)));
+  const rawKeyword = (retrieval.latestStylePathKeyword || LATEST_STYLE_DEFAULT_PATH_KEYWORD).trim();
+  const keyword = normalizeRetrievalQuery(rawKeyword);
+  const allDocs = listObsidianDocs();
+  let docs = allDocs
+    .filter((doc) => {
+      const rawHaystack = `${doc.path || ""}\n${doc.sourceId || ""}\n${doc.parentId || ""}\n${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}`;
+      const haystack = normalizeRetrievalQuery(rawHaystack);
+      return keyword ? haystack.includes(keyword) || rawHaystack.toLowerCase().includes(rawKeyword.toLowerCase()) : isLatestStyleDoc(doc, retrieval);
+    })
+    .filter((doc) => !isAdultLatestStyleDoc(doc));
+
+  if (!docs.length) {
+    docs = allDocs
+      .filter((doc) => isLatestStyleDoc(doc, retrieval))
+      .filter((doc) => !isAdultLatestStyleDoc(doc));
+  }
+
+  const sceneDocs = docs.filter((doc) => styleDocMatchesScene(doc, scene));
+  if (sceneDocs.length) docs = sceneDocs;
+  const styleDocs = splitLatestStyleDocs(docs);
+  if (!styleDocs.length) return { snippets: [], recallCount: 0, usedChars: 0, totalDocs: 0 };
+
+  const sceneQuery = `${cleanQuery}\n场景: ${scene}`;
+  const tokens = tokenize(sceneQuery).slice(0, 32);
+  let queryEmbedding: { provider: VectorProvider; model: string; vector: number[] };
+  try {
+    queryEmbedding = await embedText(settings, sceneQuery, "RETRIEVAL_QUERY");
+  } catch {
+    queryEmbedding = { provider: "local", model: "local-hash-96", vector: localEmbed(sceneQuery) };
+  }
+  try {
+    await ensureDocsIndexed(settings, styleDocs);
+  } catch {
+    // Keep latest examples available through local lexical/hash scoring when remote embedding is temporarily unavailable.
+  }
+  const indexById = new Map(listVectorIndex().map((row) => [row.id, row]));
+  const rows = styleDocs
+    .map((doc) => {
+      const vectorRow = indexById.get(doc.id);
+      const vectorCompatible = vectorRowMatchesDoc(vectorRow, doc, queryEmbedding.provider, queryEmbedding.model)
+        && vectorRow!.vector.length === queryEmbedding.vector.length;
+      const vectorScore = vectorCompatible
+        ? cosineSimilarity(queryEmbedding.vector, vectorRow!.vector)
+        : queryEmbedding.provider === "local"
+          ? cosineSimilarity(queryEmbedding.vector, localEmbed(`${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}\n${doc.content}`))
+          : 0;
+      const lexical = termHitScore(`${doc.title}\n${doc.tags.join(" ")}\n${doc.aliases.join(" ")}\n${doc.content}`, tokens);
+      const sceneHit = styleDocMatchesScene(doc, scene) ? 0.22 : 0;
+      const fusedScore = vectorScore * 0.72 + Math.min(0.28, lexical * 0.015) + sceneHit + Math.max(0, doc.importance) * 0.01;
+      return { doc, fusedScore, vectorScore };
+    })
+    .sort((left, right) => right.fusedScore - left.fusedScore || right.doc.importance - left.doc.importance || right.doc.updatedAt - left.doc.updatedAt);
+
+  const picked: MemorySnippet[] = [];
+  const seen = new Set<string>();
+  let usedChars = 0;
+  for (const row of rows) {
+    if (picked.length >= safeLimit) break;
+    if (seen.has(row.doc.id)) continue;
+    seen.add(row.doc.id);
+    const normalized = String(row.doc.content || "").replace(/\s+/g, " ").trim();
+    if (!normalized) continue;
+    const remaining = Math.max(0, LATEST_STYLE_SNIPPET_BUDGET);
+    const text = normalized.slice(0, remaining);
+    usedChars += text.length;
+    picked.push({
+      id: row.doc.id,
+      title: row.doc.title,
+      text,
+      source: "latest_style_example",
+      score: row.fusedScore,
+    });
+  }
+
+  const snippets = stabilizeLatestStyleSnippets(cacheScope, picked);
+  return { snippets, recallCount: rows.length, usedChars, totalDocs: styleDocs.length };
+}
+
 export async function retrieveMemorySnippets(query: string, limit = 4, settings?: UplinkSettings | null): Promise<MemorySnippet[]> {
   const result = await retrieveMemorySnippetsDetailed(query, limit, settings);
   recordContextRetrieval(result, settings);
@@ -2186,12 +2504,13 @@ export function getVectorBuildStatus(): VectorBuildStatus {
   return getBuildStatusFromStore();
 }
 
-export function getObsidianDocMeta(): { count: number; totalChars: number; styleCount: number } {
+export function getObsidianDocMeta(settings?: UplinkSettings | null): { count: number; totalChars: number; styleCount: number } {
   const docs = listObsidianDocs();
+  const retrieval = resolveRetrievalSettings(settings);
   return {
     count: docs.length,
     totalChars: docs.reduce((sum, doc) => sum + doc.content.length, 0),
-    styleCount: docs.filter((doc) => normalizeRetrievalQuery(`${doc.path || ""}\n${doc.title}`).includes("风格样本")).length,
+    styleCount: docs.filter((doc) => isLatestStyleDoc(doc, retrieval)).length,
   };
 }
 

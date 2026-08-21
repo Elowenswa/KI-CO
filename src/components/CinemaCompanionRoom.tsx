@@ -40,6 +40,7 @@ import { MarkdownText } from "./MarkdownText";
 interface CinemaCompanionRoomProps {
   adapters: CompanionAdapters;
   uplinkSettings: UplinkSettings;
+  isActive?: boolean;
   onOpenLongChat?: () => void;
   onOpenPersona?: () => void;
   onOpenMemory?: () => void;
@@ -624,6 +625,7 @@ function normalizeCompanionDensity(value?: string): CompanionDensity {
 export function CinemaCompanionRoom({
   adapters,
   uplinkSettings,
+  isActive = true,
   onOpenLongChat,
   onOpenPersona,
   onOpenMemory,
@@ -2268,7 +2270,7 @@ export function CinemaCompanionRoom({
                   <video
                     ref={videoRef}
                     src={videoUrl}
-                    controls
+                    controls={isActive}
                     playsInline
                     onLoadedMetadata={(event) => {
                       const video = event.currentTarget;
